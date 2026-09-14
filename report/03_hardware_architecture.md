@@ -499,6 +499,10 @@ Worst-case initial reservoir fill is:
 C_fill [cycles] = ceil((KEY_WIDTH + start_bit) / 8 bits-per-byte-cycle)
 ```
 
+This is the normal no-stall workload model that waits for a full lookup window.
+If `byte_last` arrives early, the RTL may expose a smaller nonempty partial
+window and the fill count can be lower.
+
 For `KEY_WIDTH=16`:
 
 ```text

@@ -150,9 +150,11 @@ A symbol transfers when:
 symbol_fire = symbol_valid AND symbol_ready
 ```
 
-The output register holds `symbol`, `code_length`, `table_id`, and EOB meaning
-stable while `symbol_valid=1` and `symbol_ready=0`. EOB is included as an output
-symbol and in `symbols_produced`.
+The composed output payload remains stable while `symbol_valid=1` and
+`symbol_ready=0`: the matcher result register holds symbol/length, the top's
+`active_table_q` holds `table_id`, and `symbol_eob` is combinationally derived
+from those stable registers. EOB is included as an output symbol and in
+`symbols_produced`.
 
 For a DMA implementation only the nine-bit `symbol` must be written to memory.
 `code_length` and `table_id` may remain debug/trace signals because the aggregate

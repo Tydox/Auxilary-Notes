@@ -276,7 +276,7 @@ The top provides terminal status and counters:
 |---:|---|---|
 | `0x00` | `ERR_NONE` | No error |
 | `0x02` | `ERR_BAD_CONFIG` | Invalid/incomplete configuration or illegal simultaneous write/start |
-| `0x04` | `ERR_TRUNCATED` | Input ended without enough real bits for a valid result/EOB |
+| `0x04` | `ERR_TRUNCATED` | No decodable result remains after the final input byte, including insufficient real bits |
 | `0x05` | `ERR_NO_SYMBOL` | Complete lookup window had no table match |
 | `0x06` | `ERR_SELECTOR` | Invalid or exhausted selector schedule |
 | `0x07` | `ERR_OUTPUT_OVERFLOW` | Symbol capacity was reached before accepted EOB |
@@ -354,6 +354,12 @@ not claimed as executed here**, and frequency, area, and power remain analytical
 targets/estimates. This qualification is important: logically complete RTL is
 not the same as verified, synthesizable-on-every-tool, or timing-closed hardware.
 
+The compact top test does not yet cover the 50-symbol selector transition,
+nonzero `start_bit`, every simultaneous consume/refill case, error paths, or
+exact `cycle_count`. Actual benchmark tables are checked by the Python reference
+tests, not yet by the SystemVerilog testbench. These are useful optional next
+verification steps, not evidence already claimed.
+
 ## 1.11 Intentional limits
 
 The active design intentionally does not provide:
@@ -371,6 +377,12 @@ The active design intentionally does not provide:
   `cfg_ready` and expected adapter behavior; or
 - production reliability features such as ECC, watchdog recovery, formal proof,
   or redundant error reporting.
+
+The default/test parameter sets are the supported configurations. Elaborating
+single-entry/single-table values would create zero-width `$clog2` ports, and the
+reservoir assumes `BUFFER_WIDTH>=8`, `KEY_WIDTH<=BUFFER_WIDTH`, and a five-bit
+length (`KEY_WIDTH<=31`). Formal elaboration guards are a future portability
+improvement.
 
 Those omissions are appropriate for a benchmark-specific course accelerator,
 but each must be revisited before using the design as a general product block.

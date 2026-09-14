@@ -85,6 +85,22 @@ co-design—not to claim tapeout readiness. The RTL is detailed enough to expose
 the datapath, control, protocol, error, and timing decisions. The integration
 chapter defines the missing platform wrapper clearly enough to implement later.
 
+## Timing-related RTL updates made with this report
+
+- `active_table_q` now registers selector 0 at start and the next selector only
+  on an accepted 50-symbol boundary. This removes selector memory from the
+  normal CAM critical path without changing the existing two-cycle initiation
+  interval.
+- A 5.000 ns `create_clock` constraint now records the 200 MHz target while
+  explicitly warning that a constraint is not achieved timing evidence.
+- Active-low reset comments now require synchronized deassertion to avoid
+  recovery/removal problems.
+- Inactive banks are described accurately as operand-isolated, not physically
+  clock-gated, and unpacked table-array ranges are explicit for readability.
+
+The remaining likely critical paths are the nested comparison/priority network,
+the variable reservoir consume/refill path, and the boundary-only selector read.
+
 ## Executive conclusion
 
 The design trades substantial replicated comparison logic for a simple and
@@ -96,4 +112,3 @@ Python function's self time or its useful reservoir-inclusive subtree is
 credited to the accelerator, Amdahl projections give about 1.135x to 1.626x
 whole-benchmark speedup before real integration overhead. These are projections,
 not measured hardware results.
-
