@@ -12,8 +12,8 @@ questions. Answers and clarifications will be added after discussion.
 | 1 | Pyflate, Huffman decoding, and the acceleration boundary | Complete |
 | 2 | Bits, bytes, masks, shifts, and MSB-first ordering | Complete |
 | 3 | Huffman codes and shortest-first matching | Complete |
-| 4 | What hardware acceleration changes | In progress |
-| 5 | Combinational and sequential SystemVerilog | Not started |
+| 4 | What hardware acceleration changes | Complete |
+| 5 | Combinational and sequential SystemVerilog | In progress |
 | 6 | Clocks, registers, reset, latency, and throughput | Not started |
 | 7 | Ready/valid handshakes and backpressure | Not started |
 | 8 | The one-table matcher, line by line | Not started |
@@ -1553,3 +1553,344 @@ which reduces inactive-bank switching power; all six banks still occupy area.
    and which should we retain as the conservative boundary?
 3. Does six-bank storage make one comparison six times faster? If not, what
    delay does it avoid?
+
+---
+
+# Lesson 5: Combinational and sequential SystemVerilog
+
+## 1. SystemVerilog describes a circuit
+
+The most important mental shift is that synthesizable SystemVerilog normally
+describes hardware that exists at the same time. It is not a list of CPU
+instructions that automatically run one after another.
+
+In Python, this loop reuses the CPU across time:
+
+```python
+for entry in table:
+    if matches(entry, bits):
+        return entry.symbol
+```
+
+In our matcher, a fixed-bound SystemVerilog loop describes repeated hardware:
+
+```systemverilog
+always_comb begin
+    for (int i = 0; i < NUM_ENTRIES; i++) begin
+        raw_matches[i] = lookup_valid
+                       && valid_mem[i]
+                       && ((lookup_bits & mask_mem[i]) == pattern_mem[i]);
+    end
+end
+```
+
+For `NUM_ENTRIES=147`, synthesis can unroll this into 147 masked equality
+comparisons. The loop itself does not mean 147 clock cycles. A design takes 147
+cycles only if we explicitly build state such as an index register and advance
+that index once per clock.
+
+## 2. `logic` does not automatically mean a register
+
+SystemVerilog `logic` is a signal/data type. Whether it represents remembered
+state depends on how it is driven:
+
+| Driver | Meaning in this design |
+|---|---|
+| `assign` | Continuous combinational relationship |
+| `always_comb` | Procedural description of combinational logic |
+| `always_ff @(posedge clk ...)` | Clocked state/register behavior |
+
+For example, `raw_matches` and `candidate_symbol` are declared as `logic`, but
+they are combinational. `result_valid` is also `logic`, but it is assigned in
+`always_ff`, so it is remembered by a register.
+
+Parameters such as `KEY_WIDTH=16` and `NUM_ENTRIES=147` are elaboration-time
+constants. They configure the circuit that is built; they are not ordinary
+runtime input signals.
+
+## 3. Continuous assignment
+
+This line is a continuous Boolean equation:
+
+```systemverilog
+assign lookup_ready = !result_valid || result_ready;
+```
+
+There is no clock and no stored previous value. Whenever `result_valid` or
+`result_ready` changes, the physical logic propagates toward a new
+`lookup_ready` value after its gate/wire delay.
+
+The equation implements three cases:
+
+| `result_valid` | `result_ready` | `lookup_ready` | Meaning |
+|---:|---:|---:|---|
+| 0 | 0 or 1 | 1 | Output register is empty; accept a lookup |
+| 1 | 0 | 0 | Old result is stalled; do not overwrite it |
+| 1 | 1 | 1 | Old result leaves; a new lookup may replace it |
+
+The ready/valid protocol itself is Lesson 7. Here, the key point is that
+`assign` creates combinational logic.
+
+## 4. `always_comb`: outputs depend on current inputs
+
+An `always_comb` block describes logic with no intentional memory:
+
+```text
+combinational outputs = function(current inputs, current registered state)
+```
+
+Our first combinational stage creates one `raw_matches[i]` bit per entry. The
+second stage examines those bits and selects a symbol:
+
+```systemverilog
+always_comb begin
+    candidate_found  = 1'b0;
+    candidate_symbol = '0;
+    candidate_len    = '0;
+
+    for (int l = 1; l <= KEY_WIDTH; l++) begin
+        for (int i = 0; i < NUM_ENTRIES; i++) begin
+            if (!candidate_found
+                    && raw_matches[i]
+                    && (len_mem[i] == l)) begin
+                candidate_found  = 1'b1;
+                candidate_symbol = symbol_mem[i];
+                candidate_len    = len_mem[i];
+            end
+        end
+    end
+end
+```
+
+The initial assignments are defaults. Every output receives a value even when
+no entry matches, so the block does not need to remember an earlier result.
+
+The loop over `l` starts at 1, so the generated priority logic chooses the
+shortest matching length. Although all raw comparisons are parallel, priority
+selection still has propagation delay and may become part of the critical path.
+
+## 5. Blocking assignment in combinational logic
+
+The combinational blocks use blocking assignment, written `=`:
+
+```systemverilog
+candidate_found = 1'b0;
+candidate_found = 1'b1;
+```
+
+Within one evaluation of the block, the assigned value is immediately visible
+to the following statements. That is important here: after one candidate sets
+`candidate_found`, later candidates see it as 1 and cannot replace the winner.
+
+A practical rule for this project is:
+
+```text
+always_comb -> normally use blocking assignment (=)
+always_ff   -> normally use nonblocking assignment (<=)
+```
+
+## 6. Avoiding unintended latches
+
+Consider this incomplete combinational block:
+
+```systemverilog
+always_comb begin
+    if (enable)
+        y = a;
+end
+```
+
+What should `y` be when `enable=0`? To preserve the old value, hardware would
+need memory. A synthesis tool may infer a latch, even though the author probably
+wanted combinational logic.
+
+One fix assigns a default:
+
+```systemverilog
+always_comb begin
+    y = '0;
+    if (enable)
+        y = a;
+end
+```
+
+Equivalent complete `if/else` assignments also work. This is why the matcher
+sets `candidate_found`, `candidate_symbol`, and `candidate_len` before its loops,
+and why the six-table output mux gives every output a default before checking
+`active_table`.
+
+## 7. `always_ff`: state changes at a clock edge
+
+Registers remember values between clock edges. Our table configuration is
+stored with:
+
+```systemverilog
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        valid_mem <= '0;
+    end else if (dict_wr_en && (dict_wr_addr < NUM_ENTRIES)) begin
+        pattern_mem[dict_wr_addr]
+            <= dict_wr_code << (KEY_WIDTH - dict_wr_len);
+        // Other stored fields are written here too.
+    end
+end
+```
+
+When `rst_n` is asserted low, the validity state clears. During normal operation,
+new table data is captured on a rising edge only when the write conditions are
+true. Between writes, the stored entries retain their values.
+
+An omitted assignment has different meanings in the two block types:
+
+```text
+always_comb missing a path -> unintended latch may be required
+always_ff missing a branch -> existing register intentionally holds its value
+```
+
+The output register is another sequential block:
+
+```systemverilog
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        result_valid <= 1'b0;
+        match_found  <= 1'b0;
+        match_symbol <= '0;
+        match_len    <= '0;
+    end else if (lookup_ready) begin
+        result_valid <= lookup_valid;
+        if (lookup_valid) begin
+            match_found  <= candidate_found;
+            match_symbol <= candidate_symbol;
+            match_len    <= candidate_len;
+        end
+    end
+end
+```
+
+This turns a changing combinational candidate into a result that remains stable
+while the next component is not ready.
+
+## 8. The matcher as registers and combinational clouds
+
+```mermaid
+flowchart LR
+    CFG[Configuration inputs] -->|captured on clock edge| TABLE[(Table state registers)]
+    LOOK[lookup_bits and lookup_valid] --> CMP[Combinational<br/>147 masked comparisons]
+    TABLE --> CMP
+    CMP --> PRI[Combinational<br/>shortest-first priority]
+    PRI -->|captured on clock edge| REG[(Result register)]
+    CLK((Clock)) --> TABLE
+    CLK --> REG
+    REG --> OUT[result_valid, found,<br/>symbol, length]
+```
+
+Between rising edges, signals propagate through `CMP` and `PRI`. At a rising
+edge, the result register samples the settled candidate. It then holds that
+value until another permitted register update occurs.
+
+This gives a useful abstraction:
+
+```text
+register/state -> combinational calculation -> register/state
+```
+
+Lesson 6 will calculate how much time the combinational calculation is allowed
+to take.
+
+## 9. Nonblocking assignment uses the old register values
+
+Clocked logic uses nonblocking assignment, written `<=`. All right-hand sides
+are evaluated using the state immediately before the triggering edge, and the
+register updates take effect together.
+
+For example:
+
+```systemverilog
+always_ff @(posedge clk) begin
+    a <= b;
+    b <= a;
+end
+```
+
+After the edge, `a` receives the old `b`, while `b` receives the old `a`. This
+models two registers exchanging values. Nonblocking assignment prevents the
+first source-code line from incorrectly changing what the second line reads on
+the same edge.
+
+## 10. Procedural loops versus generate loops
+
+Our RTL uses two different kinds of loop:
+
+1. A fixed procedural loop inside `always_comb` describes repeated comparison
+   or priority logic.
+2. A `generate for` loop in `huffman_find_six_table.sv` creates six physical
+   matcher instances during elaboration.
+
+```systemverilog
+generate
+    for (genvar table_index = 0;
+         table_index < NUM_TABLES;
+         table_index++) begin : gen_table
+        hardware_dictionary_accelerator matcher (...);
+    end
+endgenerate
+```
+
+Neither loop advances itself one iteration per clock. To make a sequential
+147-cycle search, we would explicitly create an entry-index register, compare
+one indexed entry, increment the index at each edge, and stop when a match is
+found.
+
+## 11. One request through the matcher
+
+For a simplified accepted request:
+
+1. Table entries already exist in registers or synthesized memory structures.
+2. `lookup_bits` and `lookup_valid` drive the combinational match logic.
+3. `raw_matches` settles to a 147-bit vector.
+4. The priority logic settles on `candidate_symbol` and `candidate_len`.
+5. At the next permitted rising edge, the result register captures them and
+   asserts `result_valid`.
+6. The register holds the result if the consumer applies backpressure.
+
+The exact physical implementation is chosen by synthesis. An array named
+`pattern_mem` is not guaranteed to become a dedicated RAM block. Because all
+147 entries are read in parallel for CAM matching, an FPGA tool may implement
+much of this structure with registers and LUT logic.
+
+## 12. What the timescale directive does not do
+
+```systemverilog
+`timescale 1ns / 1ps
+```
+
+This sets simulation time units and precision. It does not create a clock and
+does not guarantee 200 MHz. A testbench generates clock transitions; synthesis
+and timing constraints define the target hardware frequency.
+
+## Key facts to remember
+
+1. SystemVerilog describes concurrent hardware, not an automatic instruction
+   sequence.
+2. `logic` can represent combinational or registered signals.
+3. `assign` and `always_comb` describe combinational relationships.
+4. `always_ff` describes state updated at clock/reset events.
+5. Use blocking `=` for our combinational blocks and nonblocking `<=` for our
+   clocked blocks.
+6. Give combinational outputs values on every path to avoid unintended latches.
+7. A fixed HDL loop normally replicates logic; it does not automatically consume
+   one clock per iteration.
+8. Parallel comparison can still have a long priority/routing delay.
+
+## Understanding check
+
+1. Does the `for` loop that creates 147 `raw_matches` consume 147 clock cycles?
+   Explain what it creates instead.
+2. Which signals represent remembered state: `raw_matches`, `pattern_mem`,
+   `candidate_symbol`, and `result_valid`?
+3. Why are blocking assignments useful in the shortest-first combinational
+   priority block?
+4. What unwanted hardware could be inferred if an `always_comb` output is not
+   assigned for every possible path?
+5. What is the difference between the matcher loop in `always_comb` and the
+   six-table `generate for` loop?
