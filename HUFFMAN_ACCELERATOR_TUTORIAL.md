@@ -132,21 +132,85 @@ For the measured benchmark job:
 
 | Quantity | Value |
 |---|---:|
-| Total runtime | 664.900 ms |
-| Inclusive lookup fraction | 38.37% |
+| Total runtime | 662.237 ms |
+| Self/exclusive `find_next_symbol` fraction | 12.11% |
+| Self/exclusive `find_next_symbol` time | 80.21 ms |
+| Inclusive lookup fraction | 38.71% |
+| Inclusive lookup-subtree time | 256.34 ms |
 | Huffman lookup calls | 148,271 |
 
-The estimated inclusive time is:
+The two percentages answer different questions. **Self** (also called
+**exclusive**) counts samples taken while the CPU is executing the body of
+`find_next_symbol` itself. **Inclusive** (called **Children** by this `perf`
+report) counts those samples plus samples in functions called underneath it,
+including `snoopbits` and `readbits` on this call path. Some profilers use the
+word **total** for inclusive time, so column names matter more than the word
+"total."
+
+The corresponding estimates are:
 
 ```text
-T_find = T_total × lookup_fraction
-       = 664.900 ms × 0.3837
-       = 255.11 ms
+T_self      = T_total * self_fraction
+            = 662.237 ms * (4,604 / 38,010)
+            = 80.21 ms
+
+T_inclusive = T_total * inclusive_fraction
+            = 662.237 ms * (14,713 / 38,010)
+            = 256.34 ms
+
+T_children  = T_inclusive - T_self
+            = 256.34 ms - 80.21 ms
+            = 176.13 ms
 ```
 
-"Inclusive" means the profile includes time in the function and in relevant
-functions it calls, such as bit peeking and bit consumption. It is not a claim
-that every one of the 255.11 ms is spent on the comparison statement alone.
+These values are reproducible from the full-run result files:
+
+- `results/pyflate/original/original results full run/timing.json` contains 60
+  non-warmup benchmark values. Their arithmetic mean is 0.662236860 s/job.
+- `results/pyflate/original/original results full run/speedscope.folded`
+  contains the weighted folded stacks produced from `perf` samples.
+- `results/pyflate/original/original results full run/run_metadata.txt` records
+  a 199 Hz `cpu-clock` profile with frame-pointer call graphs.
+
+Within the folded stacks, 38,010 weighted samples contain the benchmark frame
+`py::bench_pyflake`. Of those, 14,713 contain
+`py::HuffmanTable.find_next_symbol`, giving the inclusive share:
+
+```text
+f_inclusive = 14,713 samples / 38,010 samples
+            = 0.387082
+            = 38.71%
+```
+
+For Python-level self attribution, 4,604 samples have `find_next_symbol` as the
+deepest Python (`py::`) frame; lower native frames are CPython operations being
+executed for that function. Therefore:
+
+```text
+f_self = 4,604 samples / 38,010 samples
+       = 0.121126
+       = 12.11%
+```
+
+The exact earlier values 38.37% and 12.02% were prior rounded/normalized
+estimates and are not literal values in the retained result files. The tutorial
+now uses the reproducible full-run calculation above. `perf` is a sampling
+profiler, so these shares are estimates rather than exact stopwatch timings.
+
+Thus, only about 80.21 ms is directly attributed to the function body. The
+256.34 ms value is the cost of the whole software lookup subtree; it is not a
+claim that every one of those milliseconds is spent on the comparison statement.
+Inclusive percentages for a parent and its children overlap and therefore must
+not be added together.
+
+Which value belongs in a speedup estimate depends on the hardware/software
+boundary. A matcher called once per symbol while software still performs
+`snoopbits` and `readbits` can claim only the self scope (and may remove less
+after communication overhead). Our batched design includes a bit reservoir and
+bit consumption, so it is intended to replace the child work too. For that
+design, 38.71% is a defensible **optimistic removable scope**, while 12.11% is
+the conservative directly attributed scope. Neither is an achieved saving until
+an end-to-end hardware measurement is made.
 
 The software repeatedly performs Python-level loops, object accesses, variable
 length bit operations, comparisons, and function calls. The operation is small,
@@ -1109,7 +1173,12 @@ flowchart LR
 ```
 
 All 147 entry comparators exist physically in one table bank. They evaluate in
-parallel rather than being reused by a 147-iteration software loop.
+parallel rather than being reused by a software loop that examines entries in
+sequence until it finds a match. The CPU loop also performs list iteration,
+Python-object and attribute access, loop/branch control, and calls to bitfield
+methods. An object access may hit a CPU cache, so it would be inaccurate to say
+that every access reaches DRAM; the important point is that the general-purpose
+CPU must execute these operations as a dependent instruction sequence.
 
 Parallel does not mean zero time. Electrical signals still pass through mask,
 comparison, and priority-selection logic. The path must settle before the next
@@ -1174,13 +1243,16 @@ Good hardware candidates tend to have several properties:
 - enough work is submitted per job to repay communication overhead.
 
 `find_next_symbol` has these properties: 148,271 repeated lookups, at most 147
-entries in each measured table, bounded 16-bit comparisons, and a 38.37%
-inclusive runtime share.
+entries in each measured table, bounded 16-bit comparisons, a 12.11% self
+runtime share, and a 38.71% inclusive call-subtree share.
 
 The surrounding bzip2 parser is a less attractive first target. It contains
 irregular control, varied fields, exceptions, dynamic software objects, and
 work that occurs far fewer times. Keeping it in software also makes the hardware
-interface smaller and easier to verify.
+interface smaller and easier to verify. Programmability lets software load the
+six tables that it parsed, but that is not the reason for the partition.
+Amortization is a separate idea: configure and start once, then decode 148,271
+symbols before returning control to software.
 
 ```mermaid
 flowchart LR
@@ -1245,12 +1317,28 @@ The same 20 microseconds paid separately for every symbol would instead be:
 
 ## 7. Component speedup versus application speedup
 
-Making one component extremely fast cannot remove time spent elsewhere. The
-measured accelerated fraction is:
+Making one component extremely fast cannot remove time spent elsewhere. We show
+two bounds so that the profile scope matches the proposed implementation:
 
-```text
-f = 0.3837
+| Case | Accelerated fraction `f` | Software scope |
+|---|---:|---:|
+| Conservative matcher-only/self | 0.121126 | 80.21 ms |
+| Batched matcher + reservoir, optimistic | 0.387082 | 256.34 ms |
+
+```mermaid
+flowchart LR
+    TOTAL[Original job<br/>662.24 ms, 100%] -->|partition| INC[Inclusive lookup subtree<br/>256.34 ms, 38.71%]
+    TOTAL -->|partition| OTHER[Everything outside subtree<br/>405.90 ms, 61.29%]
+    INC -->|contains| SELF[find_next_symbol self work<br/>80.21 ms, 12.11%]
+    INC -->|contains| CHILD[Called bit operations<br/>176.13 ms, 26.60%]
 ```
+
+The simple matcher corresponds mainly to `SELF`. In the complete top level,
+`huffman_bit_reservoir` performs peek and consume, the byte stream supplies the
+source data, and the controller repeats lookups. Functionally, our proposed
+batch accelerator therefore aims at `SELF + CHILD`. We still call the inclusive
+number optimistic because profiling is sampled and real MMIO/DMA/output costs
+are added at the new boundary.
 
 Amdahl's law is:
 
@@ -1258,31 +1346,33 @@ Amdahl's law is:
 S_total = 1 / ((1-f) + f/S_component)
 ```
 
-Our analytical hardware estimate is:
+Our analytical hardware estimate is `T_hardware = 1.482725 ms`. For the
+conservative self-only accounting:
 
 ```text
-T_hardware  = 1.482725 ms
-T_software  = 255.11 ms
-S_component = 255.11 / 1.482725 = 172.05x
+S_component,self = 80.21 ms / 1.482725 ms = 54.10x
+S_total,self = 1 / (0.878874 + 0.121126/54.10)
+             = 1.135x
+
+S_max,self = 1 / (1-0.121126) = 1.138x
 ```
 
-Therefore:
+For our intended batch boundary, where the hardware reservoir also replaces
+the software peek/consume operations:
 
 ```text
-S_total = 1 / (0.6163 + 0.3837/172.05)
-        = 1.617x estimated
+S_component,inclusive = 256.34 ms / 1.482725 ms = 172.88x
+S_total,inclusive = 1 / (0.612918 + 0.387082/172.88)
+                  = 1.626x optimistic estimate
+
+S_max,inclusive = 1 / (1-0.387082) = 1.632x
 ```
 
-Even infinitely fast Huffman hardware has an upper bound:
-
-```text
-S_max = 1 / (1-f)
-      = 1 / 0.6163
-      = 1.623x
-```
-
-The other 61.63% remains. This is why a 172x component estimate becomes only
-about 1.617x for the complete benchmark.
+The inclusive case is appropriate to the architecture we designed, but it is
+still an upper projection: MMIO/DMA setup, output handling, and any child work
+left in software reduce the achieved result. This is why the final report
+should present 1.135x as the conservative estimate and 1.626x as the optimistic
+full-boundary estimate, not as a guaranteed measurement.
 
 ## 8. The cost of parallel hardware
 
@@ -1293,8 +1383,37 @@ Parallelism consumes physical resources. The six-bank design contains:
 ```
 
 Each entry stores pattern, mask, symbol, length, and valid state and has matching
-logic. This increases area and potential power. In exchange, table selection is
-instant and lookup throughput is high.
+logic. This increases area and potential power. "Six available tables" means
+that all six are resident; it does not mean that all six decode the same symbol.
+The selector sends `lookup_valid` only to the active bank, and the result mux
+returns only that bank's answer.
+
+```mermaid
+flowchart LR
+    SEL[Selector for this 50-symbol group] --> MUX[Activate one bank]
+    WIN[16-bit lookup window] --> MUX
+    MUX --> T0[Table 0: 147 comparators]
+    MUX --> T1[Table 1: 147 comparators]
+    MUX --> TD[...]
+    MUX --> T5[Table 5: 147 comparators]
+    T0 --> OUT[Selected result]
+    T1 --> OUT
+    TD --> OUT
+    T5 --> OUT
+```
+
+Compared with one complete 147-entry bank, six banks do not make an individual
+comparison six times faster. Their main performance benefit is eliminating a
+table reload whenever the selector changes: selection is a mux operation with
+no extra cycle in the current RTL. Their cost is roughly six times the entry
+storage and comparison logic, more routing, static leakage, and potentially
+harder timing closure. Gating inactive banks reduces dynamic switching power,
+but it does not remove their area or leakage.
+
+A smaller alternative could retain six table memories but share one comparison
+engine. That saves comparator area but adds muxing or sequential reads and can
+increase lookup cycles. A single reloaded table saves still more area but adds
+configuration transfers and stalls whenever the required table is not resident.
 
 The central tradeoff is:
 
@@ -1339,7 +1458,98 @@ analysis, and Amdahl's law instead of presenting parallel logic alone.
    parallel hardware comparators?
 2. Why do we keep bzip2 header and metadata parsing in software but move the
    repeated symbol lookup into hardware?
-3. If Huffman decoding became infinitely fast but its measured fraction is
-   `f=0.3837`, calculate the maximum whole-program speedup.
+3. Calculate both perfect limits: matcher-only with `f=0.121126`, and the
+   optimistic matcher-plus-reservoir boundary with `f=0.387082`. Explain why the
+   second value is applicable to our design but must not be claimed as measured.
 4. Name one performance benefit and one hardware cost of keeping six complete
    table banks available simultaneously.
+
+## Lesson 4 discussion and corrected answers
+
+### 1. What the 147 comparators replace
+
+The answer is substantially correct. In software, the loop inspects entries in
+sequence and pays for Python list iteration, object/attribute access,
+comparisons, branches, and bitfield calls. It stops when a match is found, so it
+does not necessarily inspect all 147 entries. In one active hardware bank, 147
+masked comparisons are described concurrently and shortest-first priority logic
+selects the winner. The trade is temporal CPU work for spatial hardware.
+
+Do not say that every Python object access goes to main memory. It can be served
+by a CPU cache. "Memory/object access overhead" is accurate; "147 DRAM reads"
+is not established by the profile.
+
+### 2. Why parsing remains software
+
+The primary reason is workload shape. Header/metadata parsing is irregular and
+infrequent, while lookup is regular, bounded, parallelizable, and repeated
+148,271 times. Programmability lets the same accelerator accept the tables that
+software parsed. Parameter scalability is useful engineering, but neither is
+the definition of amortization.
+
+Amortization means paying configuration and start/finish communication once for
+a large batch, so:
+
+```text
+average setup cost per symbol = setup cost per job / symbols per job
+```
+
+### 3. Exactly which measured time our hardware targets
+
+Python-level self attribution gives the narrow matcher boundary: 12.11%,
+estimated as 80.21 ms/job. Inclusive folded-stack attribution gives the nested
+call boundary: 38.71%, estimated as 256.34 ms/job. The latter already contains
+the former.
+
+`huffman_find_simple` replaces the scan and compare portion. The completed top
+level additionally uses `huffman_bit_reservoir` to replace the accelerated
+call path's `snoopbits` and `readbits`, streams source bytes, chooses selectors,
+and repeats lookups without returning to software. Therefore the functional
+goal is to replace the inclusive subtree. Use 256.34 ms only as an optimistic
+projection; use 80.21 ms as the conservative directly attributed scope and
+report both. The hardware does not replace RUNA/RUNB expansion, MTF, inverse
+BWT, final RLE, or unrelated parsing.
+
+For infinitely fast hardware, the two Amdahl limits are:
+
+```text
+S_max,self      = 1 / (1 - 0.121126) = 1.138x
+S_max,inclusive = 1 / (1 - 0.387082) = 1.632x
+```
+
+With the analytical 1.482725 ms hardware time, they become approximately 1.135x
+and 1.626x before communication overhead. These are estimates, not synthesis or
+end-to-end measurements.
+
+### 4. What six complete banks buy and cost
+
+The answer has the right direction, with one correction: the design still
+switches tables logically through `active_table`; it avoids **reloading** the
+table contents. Six banks do not shorten the compare latency relative to one
+equally parallel 147-entry bank. They remove reconfiguration stalls when the
+bzip2 selector changes.
+
+Using the current stored fields, an approximate raw storage count is:
+
+```text
+bits per entry = 16 pattern + 16 mask + 9 symbol + 5 length + 1 valid
+               = 47 bits/entry
+
+six-bank storage = 6 * 147 entries * 47 bits/entry
+                 = 41,454 bits
+                 = about 40.5 Kibit, excluding control and comparator logic
+```
+
+The performance benefit is immediate table selection with no reload cycle. The
+cost is more LUT/comparator logic, registers or memory bits, routing, leakage,
+and timing pressure. Only one bank receives a valid lookup in the current RTL,
+which reduces inactive-bank switching power; all six banks still occupy area.
+
+### Short follow-up check
+
+1. For one symbol, how many table banks are resident, how many are selected, and
+   how many entry comparisons occur in the selected bank?
+2. Which profile fraction should we use as the intended optimistic boundary,
+   and which should we retain as the conservative boundary?
+3. Does six-bank storage make one comparison six times faster? If not, what
+   delay does it avoid?
