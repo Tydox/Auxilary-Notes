@@ -1894,3 +1894,41 @@ and timing constraints define the target hardware frequency.
    assigned for every possible path?
 5. What is the difference between the matcher loop in `always_comb` and the
    six-table `generate for` loop?
+
+## Lesson 5 answers
+
+### 1. The 147-entry loop
+
+It does not take 147 clock cycles. With the fixed parameter value, synthesis
+unrolls the loop into 147 masked comparison lanes. They evaluate concurrently,
+then feed the priority-selection network. This spends hardware area and creates
+combinational propagation delay, not 147 sequential cycles.
+
+### 2. Signals that remember state
+
+`pattern_mem` and `result_valid` are remembered state because `always_ff`
+assigns them. `raw_matches` and `candidate_symbol` are combinational values
+because `always_comb` assigns them. The declaration type `logic` alone does not
+answer whether a signal is registered.
+
+### 3. Blocking assignment in the priority block
+
+Blocking assignment makes an update immediately visible to later statements in
+the same combinational evaluation. Once the shortest matching entry sets
+`candidate_found=1`, the remaining loop iterations see that value and cannot
+replace the chosen candidate. This procedural ordering describes priority
+logic; it does not insert clock cycles.
+
+### 4. Missing combinational assignment
+
+If an output is not assigned on every path, retaining its previous value may
+require a latch. That latch is normally unintended here. Defaults at the start
+of the block, or a complete `if/else` or `case`, ensure purely combinational
+behavior.
+
+### 5. Procedural and generate loops
+
+A fixed loop inside `always_comb` repeats operations within one combinational
+network. The `generate for` loop repeats structural instances, creating six
+matcher modules. Neither advances with time. A counter and state machine would
+be required to distribute loop iterations over multiple cycles.
