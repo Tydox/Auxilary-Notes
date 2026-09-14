@@ -13,8 +13,8 @@ questions. Answers and clarifications will be added after discussion.
 | 2 | Bits, bytes, masks, shifts, and MSB-first ordering | Complete |
 | 3 | Huffman codes and shortest-first matching | Complete |
 | 4 | What hardware acceleration changes | Complete |
-| 5 | Combinational and sequential SystemVerilog | In progress |
-| 6 | Clocks, registers, reset, latency, and throughput | Not started |
+| 5 | Combinational and sequential SystemVerilog | Complete |
+| 6 | Clocks, registers, reset, latency, and throughput | Complete |
 | 7 | Ready/valid handshakes and backpressure | Not started |
 | 8 | The one-table matcher, line by line | Not started |
 | 9 | Six tables and the selector controller | Not started |
@@ -1932,3 +1932,525 @@ A fixed loop inside `always_comb` repeats operations within one combinational
 network. The `generate for` loop repeats structural instances, creating six
 matcher modules. Neither advances with time. A counter and state machine would
 be required to distribute loop iterations over multiple cycles.
+
+---
+
+# Lesson 6: Clocks, registers, reset, latency, and throughput
+
+## 1. A clock divides operation into periods
+
+A synchronous circuit uses repeated clock edges as coordination points. The
+frequency says how many periods occur per second, and the period says how much
+time exists between corresponding edges:
+
+```text
+T_clock [s/cycle] = 1 / f_clock [cycles/s]
+f_clock [cycles/s] = 1 / T_clock [s/cycle]
+```
+
+Our target is 200 MHz:
+
+```text
+f_clock = 200 MHz
+        = 200,000,000 cycles/s
+
+T_clock = 1 / 200,000,000 cycles/s
+        = 0.000000005 s/cycle
+        = 5 ns/cycle
+```
+
+Thus adjacent rising edges are five nanoseconds apart. A higher frequency gives
+less time for combinational logic; it is not automatically achievable.
+
+## 2. What happens between two rising edges
+
+A simplified register-to-register path works as follows:
+
+1. At edge `k`, a source register launches its new output.
+2. That signal propagates through gates and routing.
+3. It must reach the destination register early enough before edge `k+1`.
+4. At edge `k+1`, the destination captures it.
+
+```mermaid
+flowchart LR
+    SRC[(Source register)] -->|clock-to-Q delay| LOGIC[Combinational logic]
+    LOGIC -->|logic and route delay| DST[(Destination register)]
+    CLK((Clock edges<br/>5 ns apart at 200 MHz)) --> SRC
+    CLK --> DST
+```
+
+For our matcher, a likely maximum-delay path is:
+
+```text
+table/result source state
+    -> 16-bit mask and equality comparison
+    -> 147-entry shortest-first priority selection
+    -> matcher result register
+```
+
+The reservoir has another candidate path: a variable-length 32-bit shift plus
+bit-count and refill control.
+
+At a selector boundary, another timing risk begins at the selector-index
+register, reads the asynchronously indexed selector array, gates the active
+bank, and then reaches the matcher result register. Synthesis and routing—not
+the RTL text—determine which of these paths is actually worst.
+
+## 3. Setup time, hold time, and uncertainty
+
+The destination register needs data to be stable shortly before its capture
+edge. That requirement is **setup time**. Data must also remain stable briefly
+after the edge; that requirement is **hold time**.
+
+For a maximum-delay/setup check, a simplified constraint is:
+
+```text
+T_clock_to_Q + T_logic + T_route + T_setup + T_uncertainty <= T_clock
+```
+
+where:
+
+- `T_clock_to_Q` is the source register's output delay after an edge;
+- `T_logic` is delay through gates/LUTs;
+- `T_route` is physical wire delay;
+- `T_setup` is the destination register requirement; and
+- `T_uncertainty` accounts for clock variation, skew, and margin.
+
+Static timing analysis also checks minimum-delay/hold paths. Passing setup does
+not by itself prove that hold timing passes.
+
+## 4. Critical path, slack, and maximum frequency
+
+Static timing analysis examines many paths. The path that most restricts the
+clock is the **critical path**.
+
+For a simplified setup report:
+
+```text
+slack [ns] = required arrival time [ns] - actual arrival time [ns]
+```
+
+Interpretation:
+
+```text
+positive slack -> path meets the target with margin
+zero slack     -> path barely meets the target
+negative slack -> target frequency is not met
+```
+
+Example only, if the complete critical-path requirement is 6.4 ns:
+
+```text
+target period = 5.0 ns
+path time     = 6.4 ns
+
+slack = 5.0 ns - 6.4 ns
+      = -1.4 ns
+
+F_max approximately = 1 / 6.4 ns
+                    = 156.25 MHz
+```
+
+The 200 MHz comment in the RTL is a target, not a measurement. We cannot obtain
+real LUT and routing delays from the source code alone. The normal proof flow is:
+
+1. choose a specific FPGA or ASIC technology;
+2. apply a 5.000 ns clock constraint;
+3. synthesize the RTL;
+4. place and route the mapped hardware; and
+5. inspect static timing reports for worst setup and hold slack.
+
+An illustrative FPGA constraint is:
+
+```tcl
+create_clock -name clk -period 5.000 [get_ports clk]
+```
+
+Because this course project does not require implementation on a device, we
+label 200 MHz as an expected target and all resulting times as analytical
+estimates, unless tool reports are later produced.
+
+## 5. Latency, initiation interval, and throughput are different
+
+These terms answer different questions:
+
+| Term | Question | Unit |
+|---|---|---|
+| Latency | How long until one request's result is available/accepted? | cycles or seconds/request |
+| Initiation interval (`II`) | How many cycles between accepted new requests? | cycles/request |
+| Throughput | How many results can be completed per second? | results/s |
+
+For a steady pipeline with no stalls:
+
+```text
+throughput [symbols/s] = f_clock [cycles/s] / II [cycles/symbol]
+```
+
+A pipeline may have latency of several cycles while still having `II=1`. For
+example, after a three-stage pipeline fills, it can complete one result every
+cycle even though each individual request takes three cycles to traverse it.
+
+## 6. Standalone matcher versus complete feedback loop
+
+The one-entry matcher can replace an accepted old result and capture a new
+lookup on the same edge when `result_ready=1`. Considered alone, it can support
+an initiation interval of one cycle.
+
+The complete top intentionally allows only one outstanding symbol. The next
+lookup window depends on the current result's variable `match_len`, because the
+reservoir cannot know which bits come next until that length is accepted. The
+top therefore uses:
+
+```systemverilog
+matcher_lookup_valid = ... && !matcher_result_valid;
+```
+
+This creates the following no-stall schedule:
+
+```mermaid
+sequenceDiagram
+    participant R as Bit reservoir
+    participant M as Matcher result register
+    participant O as Output consumer
+    R->>M: Edge 0: accept lookup for symbol 0
+    M-->>O: During cycle 0-1: result 0 is valid
+    O->>M: Edge 1: accept result 0
+    M->>R: Edge 1: consume match_len bits
+    Note over R,M: Form the next lookup window
+    R->>M: Edge 2: accept lookup for symbol 1
+    M-->>O: During cycle 2-3: result 1 is valid
+    O->>M: Edge 3: accept result 1 and consume bits
+```
+
+New lookup acceptances occur at edges 0, 2, 4, and so on:
+
+```text
+II_top = 2 cycles/symbol
+```
+
+At 200 MHz:
+
+```text
+steady symbol interval = II * T_clock
+                       = 2 cycles/symbol * 5 ns/cycle
+                       = 10 ns/symbol
+
+maximum no-stall throughput = 200,000,000 cycles/s / 2 cycles/symbol
+                            = 100,000,000 symbols/s
+```
+
+From an already-valid reservoir window to `symbol_valid` takes one register
+clock. Accepting that symbol and consuming its bits occurs on the following
+edge, so window-to-consumption takes two clocks. If latency is measured only
+from the lookup-acceptance edge to the output-handshake edge, it is one clock.
+Stating the endpoints avoids an apparent contradiction. The feedback dependency
+prevents accepting the next lookup on the output edge. Backpressure or missing
+input bytes can extend both effective latency and the observed interval.
+
+## 7. Why the reservoir initially needs up to three byte cycles
+
+Before ordinary decoding, the 16-bit lookup window must be available. The first
+byte can contribute from one to eight valid bits because `start_bit` may discard
+zero through seven leading bits.
+
+Worst case, `start_bit=7`:
+
+```text
+after byte 0: 1 valid bit
+after byte 1: 1 + 8 = 9 valid bits
+after byte 2: 9 + 8 = 17 valid bits
+```
+
+Therefore the analytical worst-case initial fill is:
+
+```text
+C_fill = ceil((KEY_WIDTH + start_bit) / 8)
+       = ceil((16 + start_bit) / 8)
+
+start_bit = 0      -> C_fill = 2 cycles
+start_bit = 1..7   -> C_fill = 3 cycles
+```
+
+The input stream can continue refilling concurrently with later decoding when
+space exists in the 32-bit reservoir. At the worst code length, decoding needs
+16 bits every two cycles, or eight bits/cycle, exactly matching the one-byte-per-
+cycle input interface when the producer never stalls.
+
+## 8. Complete decode-time estimate
+
+For `N` symbols, initial fill `C_fill`, and initiation interval `II`, the ideal
+no-stall schedule is:
+
+```text
+C_ideal [cycles] = C_fill + N*II
+
+C_total [cycles] = C_ideal + C_additional_bubbles
+
+T_decode [s]
+    = C_total [cycles] / f_clock [cycles/s]
+```
+
+The generic pipeline form is `C_first + (N-1)*II`, where `C_first` includes the
+latency to the first completion. For this particular controller,
+`C_fill + N*II` is equivalent because `C_fill` counts only byte filling and the
+first symbol then uses the same two-cycle service interval as every other
+symbol.
+
+`C_additional_bubbles` means cycles that actually extend completion beyond the
+ideal schedule. Do not blindly add the raw input- and output-stall counters:
+they can overlap each other, and an absent input byte can be counted while the
+reservoir still has enough bits for useful decoding.
+
+For the measured `N=148,271` symbols including EOB, nonzero `start_bit` so
+`C_fill=3`, `II=2`, continuous input, always-ready output, and no error:
+
+```text
+C_decode = 3 + 148,271*2
+         = 296,545 cycles
+
+T_decode = 296,545 cycles / 200,000,000 cycles/s
+         = 0.001482725 s
+         = 1.482725 ms
+```
+
+This is a core execution estimate. It does not include table/selector
+configuration, DMA setup, driver calls, interrupts, cache maintenance, or
+software processing of returned symbols.
+
+With `start_bit=0`, the total is one cycle lower:
+
+```text
+C_decode = 2 + 148,271*2 = 296,544 cycles
+T_decode = 1.482720 ms at 200 MHz
+```
+
+If the design achieved only 156.25 MHz while retaining `II=2`:
+
+```text
+T_decode = 296,545 cycles / 156,250,000 cycles/s
+         = 0.001897888 s
+         = 1.898 ms
+```
+
+This shows why cycle count and clock frequency must both be stated.
+
+## 9. Stalls change achieved throughput
+
+The top level exposes counters that separate useful scheduling from waiting:
+
+```text
+cycle_count
+input_stall_cycles
+output_stall_cycles
+symbols_produced
+bits_consumed
+```
+
+Given an achieved clock frequency:
+
+```text
+measured core time [s] = cycle_count [cycles] / f_clock [cycles/s]
+
+achieved symbol throughput [symbols/s]
+    = symbols_produced / measured core time
+    = symbols_produced * f_clock / cycle_count
+```
+
+An input-stall count means the reservoir could accept a byte but no byte was
+offered; it does not necessarily mean decoding stopped that cycle. An output
+stall means a symbol is valid but the downstream consumer is not ready and does
+block progress. The counters are diagnostic and may overlap, while
+`cycle_count` gives the exact busy-cycle total for the run.
+
+## 10. Reset versus per-job initialization
+
+The design uses active-low asynchronous reset syntax:
+
+```systemverilog
+always_ff @(posedge clk or negedge rst_n)
+```
+
+`rst_n=0` asserts reset without waiting for a clock edge. Normal register updates
+occur at `posedge clk` when `rst_n=1`. On physical hardware, asynchronous-reset
+deassertion is normally synchronized to avoid recovery/removal timing problems.
+
+Reset and starting a new job are not identical:
+
+| Operation | Purpose |
+|---|---|
+| Global reset | Put the entire accelerator into a known safe state and invalidate configuration |
+| Reservoir `clear` | Empty bit state and load `start_bit` for a new job on a clock edge |
+| Top-level `start` | Clear per-job counters/status and enter `busy` if configuration is valid |
+
+Only table validity needs reset; invalid payload bits cannot affect a match.
+Job start preserves previously loaded table and selector configuration so it can
+be reused when appropriate.
+
+## 11. Pipelining as a timing tradeoff
+
+If comparison plus priority selection cannot settle within five nanoseconds, one
+option is to add a register between them:
+
+```text
+before: comparison + priority -> result register
+
+after:  comparison -> raw-match register -> priority -> result register
+```
+
+This shortens each combinational stage but adds latency and registers. For
+independent inputs, a well-designed pipeline can add latency without reducing
+throughput. Our next lookup depends on the previous variable-length result, so a
+simple extra stage would also lengthen the feedback loop and could change the
+top from `II=2` to approximately `II=3`. Keeping high throughput would require a
+more sophisticated feedback or speculative design.
+
+Other timing alternatives include a tree priority encoder, fewer shared
+comparators over more cycles, a canonical-range decoder, or a lower target
+frequency. Each trades timing, area, power, complexity, or throughput.
+
+This lesson analyzes `huffman_find_simple_top.sv`. The separate, more complex
+`huffman_find_accel.sv` document discusses a different performance architecture
+with different initiation-interval assumptions; its numbers must not be mixed
+with this simplified top's `II=2` estimate.
+
+## Key facts to remember
+
+1. `200 MHz` means a five-nanosecond clock period.
+2. The combinational path between registers must meet setup and hold checks.
+3. Positive setup slack passes; negative setup slack fails the chosen target.
+4. Actual timing requires a technology, synthesis, place-and-route, and static
+   timing analysis.
+5. Latency is time for one request; `II` is spacing between requests; throughput
+   is completed work per second.
+6. The standalone matcher can support `II=1`, while the current reservoir
+   feedback wrapper deliberately has `II=2`.
+7. With `II=2` at 200 MHz, the no-stall throughput ceiling is 100 million
+   symbols/s.
+8. `296,545` cycles at 200 MHz gives the analytical 1.482725 ms core time.
+9. Reset, reservoir clear, and job start have different scopes.
+
+## Understanding check
+
+1. What clock period corresponds to 250 MHz? Show the formula and units.
+2. If a required period is 5.0 ns and a path takes 6.4 ns, what is its setup
+   slack, and does it meet 200 MHz?
+3. Why can the standalone matcher support `II=1` while the complete top uses
+   `II=2`?
+4. For `N=1,000`, `C_fill=3`, `II=2`, and zero stalls, calculate total cycles
+   and core time at 200 MHz.
+5. Why is the reservoir's per-job `clear` different from the global `rst_n`?
+
+## Lesson 6 answers
+
+### 1. Clock period at 250 MHz
+
+Frequency is the number of clock cycles per second, while period is the time
+available for one cycle:
+
+```text
+T_clock = 1 / f_clock
+        = 1 / (250 x 10^6 cycles/s)
+        = 4 x 10^-9 s/cycle
+        = 4 ns/cycle
+```
+
+Therefore, a 250 MHz clock has a period of **4 ns**.
+
+### 2. Setup slack for a 6.4 ns path
+
+Setup slack is the required arrival time minus the actual path time:
+
+```text
+setup slack = required time - actual path time
+            = 5.0 ns - 6.4 ns
+            = -1.4 ns
+```
+
+The negative slack means that the signal arrives 1.4 ns too late, so this path
+does **not** meet the 200 MHz target. Ignoring additional timing margins, a
+6.4 ns path corresponds to an approximate upper frequency of:
+
+```text
+F_max approximately = 1 / 6.4 ns
+                    = 156.25 MHz
+```
+
+This `F_max` is only an interpretation of the example path delay, not a timing
+result for our RTL. A real result requires synthesis, placement, routing, and
+static timing analysis for a selected implementation technology.
+
+### 3. Why the matcher can use II=1 but the top currently uses II=2
+
+The standalone matcher has an elastic, one-entry result register:
+
+```systemverilog
+lookup_ready = !result_valid || result_ready;
+```
+
+If the old result is being accepted (`result_valid && result_ready`), the
+matcher may capture a new lookup on that same rising clock edge. It can
+therefore accept one independent lookup every cycle when the receiver never
+stalls, giving `II=1`.
+
+The complete decoder has a feedback dependency. Its next lookup window depends
+on the current symbol's `match_len`:
+
+```text
+find current symbol
+        -> accept current result
+        -> consume match_len bits
+        -> expose the next lookup window
+        -> find next symbol
+```
+
+Our simple top-level controller waits for the result handshake and consumes the
+matched bits before issuing the next lookup. Consequently, accepted lookup
+requests are two clocks apart, giving `II=2`. This is a property of the current
+controller architecture, not a fundamental rule that every Huffman accelerator
+must have `II=2`.
+
+### 4. Time for 1,000 symbols
+
+For the current controller's no-stall timing model:
+
+```text
+C_total = C_fill + N x II
+        = 3 cycles + (1,000 symbols x 2 cycles/symbol)
+        = 2,003 cycles
+```
+
+At 200 MHz:
+
+```text
+T_clock = 1 / (200 x 10^6 cycles/s) = 5 ns/cycle
+
+T_core = C_total x T_clock
+       = 2,003 cycles x 5 ns/cycle
+       = 10,015 ns
+       = 10.015 us
+```
+
+Thus the estimate is **2,003 cycles**, or **10.015 microseconds**. It assumes
+continuous input availability, an always-ready output receiver, no decoding
+errors, and a realized 200 MHz clock. Configuration and software communication
+time are not included.
+
+### 5. Reservoir `clear` versus global `rst_n`
+
+`rst_n` is the global hardware reset. It initializes the complete accelerator,
+invalidates programmed matcher entries, resets control state, and returns the
+design to a known condition. In the current RTL it is active-low, and assertion
+is asynchronous.
+
+The reservoir's `clear` is a narrower, synchronous per-job operation. It throws
+away buffered bits and resets the reservoir's valid-bit count so a new
+compressed stream can begin. It does not invalidate the six programmed Huffman
+tables. This separation lets software configure reusable tables and then start
+a new decoding job without necessarily reprogramming every table entry.
+
+The short rule is:
+
+```text
+rst_n  -> reset the accelerator as a hardware system
+clear  -> empty stream-specific reservoir state for a new job
+```
