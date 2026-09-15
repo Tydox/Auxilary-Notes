@@ -276,7 +276,7 @@ EOB מועבר דרך result stream הרגיל. Completion מופעל רק ב-cl
 | `0x06` | `ERR_SELECTOR` | לוח ה-selector אינו תקין או הסתיים |
 | `0x07` | `ERR_OUTPUT_OVERFLOW` | ה-symbol capacity הושג לפני EOB שהתקבל |
 
-סיווג no-match שממומש משתמש ב-flag הרשום `reservoir_last_seen`: הוא מדווח
+סיווג no-match שממומש משתמש ב־registered flag בשם `reservoir_last_seen`: הוא מדווח
 `ERR_TRUNCATED` כאשר flag זה מוגדר, ואחרת מדווח `ERR_NO_SYMBOL`. לכן, גם חלון
 lookup מלא של 16-bit שאין עבורו match לאחר ה-input byte האחרון מסווג במימוש
 ה-RTL הנוכחי בתור `ERR_TRUNCATED`.
@@ -296,7 +296,7 @@ stall counters הם קטגוריות diagnostic, ואין לחבר אותם או
 
 ## 1.8 Initiation interval ופשטות מכוונת
 
-ל-table engine עצמו יש output רשום בעל entry אחד, והוא יכול לקבל lookup עצמאי
+ל-table engine עצמו יש registered output בעל entry אחד, והוא יכול לקבל lookup עצמאי
 אחד בכל cycle כאשר התוצאות מתקבלות ברציפות. אולם ל-decoder המלא קיימת תלות
 feedback בעלת אורך משתנה:
 

@@ -537,7 +537,7 @@ accelerator אמיתי המחובר ל-Linux דורש בדרך כלל kernel dri
 ה-parsing של Huffman שייך ל-userspace ולא ל-driver. ה-driver מבצע validation
 לייצוג הארוז לשם בטיחות; ספריית Python/C בונה אותו.
 
-ב-FPGA SoC מסוג bare-metal, אותן אחריויות יכולות להימצא בספריית hardware
+ב-FPGA SoC מסוג bare-metal, אותם תחומי אחריות יכולים להימצא בספריית hardware
 abstraction קטנה במקום ב-kernel driver. ב-coherent shared memory, חלק מפעולות
 ה-cache נעלמות, אך כללי ה-ordering וה-completion נשארים.
 
@@ -631,4 +631,4 @@ bytes, ואת MD5 `afa004a630fe072901b1d9628b960974` כבדיקת נכונות �
 | שינוי Python | Pseudocode וגבול שינוי מדויק | מימוש backend של simulation או device |
 | מפת MMIO | specification לוגי | RTL של AXI4-Lite slave |
 | DMA | נדרש קונספטואלית עבור batching שימושי | RTL של AXI master/FIFO/width-converter |
-| Driver | יש להסביר את האחריויות בלבד | Linux driver, IRQ, IOMMU, timeout |
+| Driver | יש להסביר את תחומי האחריות בלבד | Linux driver, IRQ, IOMMU, timeout |

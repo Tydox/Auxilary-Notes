@@ -179,7 +179,7 @@ status bit, ולנקות bit זה בעקבות acknowledgement מה-Software א�
 
 | Signal | רוחב | Source -> destination | מטרה |
 |---|---:|---|---|
-| `active_table_q` | 3 | top register -> six-table wrapper | בחירת bank רשומה עבור timing רגיל של lookup |
+| `active_table_q` | 3 | top register -> six-table wrapper | בחירת bank הנשמרת ב־register עבור timing רגיל של lookup |
 | `selector_current_valid` | 1 | top combinational check | מוכיח שה-selector index/count/table חוקיים |
 | `reservoir_peek_bits` | 16 | reservoir -> matcher | חלון ה-bits הבא, מיושר לצד ה-MSB |
 | `reservoir_peek_valid` | 1 | reservoir -> top | חלון מלא, או חלון סופי חלקי וחוקי, חשוף |
@@ -187,7 +187,7 @@ status bit, ולנקות bit זה בעקבות acknowledgement מה-Software א�
 | `reservoir_last_seen` | 1 | reservoir -> top | ה-input byte האחרון התקבל |
 | `matcher_lookup_valid` | 1 | top -> selected matcher | מבקש match רק כאשר אין תוצאה קודמת שממתינה |
 | `matcher_lookup_ready` | 1 | matcher -> top | ה-selected output register יכול לקבל request |
-| `matcher_result_valid` | 1 | matcher -> top | קיימת תוצאת match/no-match רשומה |
+| `matcher_result_valid` | 1 | matcher -> top | קיימת registered result של match/no-match |
 | `matcher_result_ready` | 1 | top -> matcher | מסיר תוצאה שהתקבלה או מנקז terminal bad result |
 | `matcher_found` | 1 | matcher -> top | לפחות table entry אחד יצר match |
 | `matcher_symbol` | 9 | matcher -> top | ה-decoded symbol שנבחר |
@@ -375,9 +375,9 @@ delay; שינוי ה-clock period אינו פותר אותם ישירות.
 2. variable left shift ברוחב 32-bit יחד עם בחירת bit-count/refill ->
    reservoir registers; וכן
 3. רק בגבול של כל 50 symbols, הגדלת selector index -> קריאת selector-memory
-   -> בדיקת טווח -> active table רשום.
+   -> בדיקת טווח -> active-table register.
 
-רישום `active_table_q` כבר הסיר את ה-selector memory ממסלול ה-CAM הרגיל עבור
+העברת `active_table_q` דרך register כבר הסירה את ה-selector memory ממסלול ה-CAM הרגיל עבור
 כל symbol. אם מסלול הגבול עדיין איטי, ניתן להוסיף next selector שנעשה לו
 prefetch או synchronous selector RAM stage. אם מסלול ה-CAM/priority איטי,
 balanced priority tree, CAM מחולק או canonical-range decoder עדיפים על קבלה

@@ -4,6 +4,11 @@
 ושישה tables, שה־top-level module שלו הוא `huffman_find_simple_top`. הדוח מחולק
 לשבעת הפרקים שהתבקשו, כדי שיהיה אפשר לעבור על החומר או להסיר אותו פרק אחר פרק.
 
+**מדיניות terminology:** ההסברים תורגמו לעברית, אך terminology מקצועי מקובל
+נשאר באנגלית—למשל `cache`, `register`, `pipeline`, `interface`, `ready/valid`,
+`MMIO`, `DMA`, `driver`, `RTL` ו־`SystemVerilog`. גם identifiers, signal names,
+קוד, נוסחאות, מספרים ונתיבי קבצים נשמרו כפי שהם במקור.
+
 ## פרקי הדוח
 
 1. [תיאור ה־hardware](01_hardware_description.md)
@@ -65,9 +70,9 @@ huffman_find_simple_top
 - בחירת ההתאמה בעלת הקוד הקצר ביותר תחילה;
 - streaming reservoir מסוג MSB-first ברוחב 32 bit;
 - בחירת table מחדש בכל 50 symbols שהתקבלו;
-- טיפול רשום בתוצאת ready/valid וב־backpressure;
+- טיפול ב־registered ready/valid result וב־backpressure;
 - זיהוי EOB, בדיקת capacity, terminal errors ו־performance counters;
-- בדיקות bounds בעת programming ו־active selector רשום; וכן
+- בדיקות bounds בעת programming ו־active selector הנשמר ב־register; וכן
 - source של unit testbench ושל top-level testbench שהם self-checking.
 
 הדברים הבאים מוגדרים בדוח, אך תלויי platform בכוונה ולכן אינם ממומשים:

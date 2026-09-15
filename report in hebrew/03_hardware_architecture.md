@@ -19,7 +19,7 @@
 flowchart LR
     B["stream של bytes"] --> R["reservoir בגודל 32-bit"]
     R -->|"16 ה-bits הבאים"| M["matcher נבחר עם 147 entries"]
-    M -->|"symbol + אורך"| O["output רשום"]
+    M -->|"symbol + אורך"| O["registered output"]
     O -.->|האורך שאושר| R
 ```
 
@@ -179,7 +179,7 @@ flowchart TD
 
 ### סוף ה-input
 
-לפני `byte_last`, האות `peek_valid` דורש לפחות 16 bits אמיתיים. לאחר שה-byte
+לפני `byte_last`, ה־signal `peek_valid` דורש לפחות 16 bits אמיתיים. לאחר שה-byte
 האחרון התקבל, הוא מאפשר גם חלון חלקי שאינו ריק:
 
 ```text
@@ -279,7 +279,7 @@ bank_valid[k] = lookup_valid AND (active_table_q == k), k=0..5
 
 שדות ה-ready/result של ה-bank שנבחר עוברים mux בחזרה. banks שאינם פעילים רואים
 `lookup_valid=0` ו-`lookup_bits=0`. זהו operand isolation ולא clock gating;
-ה-state הרשום של ה-banks עדיין מחובר ל-`clk`.
+ה־registered state של ה-banks עדיין מחובר ל-`clk`.
 
 ```mermaid
 flowchart TB
@@ -331,7 +331,7 @@ else:
 
 EOB שהתקבל מסיים קודם את הפעולה ואינו מנסה להביא selector נוסף.
 
-### מדוע ה-selector רשום
+### מדוע ה־selector נשמר ב־register
 
 קריאה אסינכרונית מ-selector שמזינה ישירות את `active_table` הייתה יוצרת:
 
@@ -474,7 +474,7 @@ flowchart TD
     S -->|לא| ES["ERR_SELECTOR; done"]
     S -->|כן| C{"ה-capacity כבר נוצל?"}
     C -->|כן| EC["ERR_OUTPUT_OVERFLOW; done"]
-    C -->|לא| F{"no-match רשום?"}
+    C -->|לא| F{"registered no-match?"}
     F -->|כן| EN["ERR_NO_SYMBOL או ERR_TRUNCATED; done"]
     F -->|לא| L{"אורך ההתאמה גדול ממספר ה-bits האמיתיים?"}
     L -->|כן| ET["ERR_TRUNCATED; done"]

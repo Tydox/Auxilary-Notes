@@ -84,7 +84,7 @@ flowchart LR
 ```
 
 ה-feedback המקווקו מסביר מדוע ל-top המלא יש initiation interval של שני cycles,
-אף שה-output של ה-matcher רשום.
+אף שה-output של ה-matcher הוא registered.
 
 ## תרשים D — פנים ה-Accelerator באופן לא קומפקטי, כולל רוחבי signals
 
@@ -210,8 +210,8 @@ flowchart LR
 ```mermaid
 flowchart LR
     G0["symbols שהתקבלו 1..50<br/>selector[0]"] --> E0["קבלת symbol 50"]
-    E0 --> L1["רישום selector[1]"] --> G1["symbols שהתקבלו 51..100<br/>selector[1]"]
-    G1 --> E1["קבלת symbol 100"] --> L2["רישום selector[2]"] --> G2["symbols 101..150"]
+    E0 --> L1["register selector[1]"] --> G1["symbols שהתקבלו 51..100<br/>selector[1]"]
+    G1 --> E1["קבלת symbol 100"] --> L2["register selector[2]"] --> G2["symbols 101..150"]
     G0 -.->|EOB עשוי לסיים מוקדם| DONE["done"]
     G1 -.->|EOB עשוי לסיים מוקדם| DONE
     G2 -.->|EOB עשוי לסיים מוקדם| DONE
@@ -253,7 +253,7 @@ stateDiagram-v2
     Configure --> Fill: start תקין
     Idle --> Fill: start תקין עם configuration שנשמר
     Fill --> Lookup: חלון lookup תקף
-    Lookup --> Result: match רשום
+    Lookup --> Result: registered match
     Result --> Result: output backpressure
     Result --> Fill: symbol התקבל, נדרש refill
     Result --> Lookup: symbol התקבל, נותר חלון
