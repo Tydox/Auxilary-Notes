@@ -15,7 +15,7 @@ questions. Answers and clarifications will be added after discussion.
 | 4 | What hardware acceleration changes | Complete |
 | 5 | Combinational and sequential SystemVerilog | Complete |
 | 6 | Clocks, registers, reset, latency, and throughput | Complete |
-| 7 | Ready/valid handshakes and backpressure | Not started |
+| 7 | Ready/valid handshakes and backpressure | In progress |
 | 8 | The one-table matcher, line by line | Not started |
 | 9 | Six tables and the selector controller | Not started |
 | 10 | The streaming bit reservoir | Not started |
@@ -1991,10 +1991,12 @@ table/result source state
 The reservoir has another candidate path: a variable-length 32-bit shift plus
 bit-count and refill control.
 
-At a selector boundary, another timing risk begins at the selector-index
-register, reads the asynchronously indexed selector array, gates the active
-bank, and then reaches the matcher result register. Synthesis and routing—not
-the RTL text—determine which of these paths is actually worst.
+The active selector is now registered, so selector RAM is not in the normal
+bank-to-CAM path. At a 50-symbol boundary, a separate timing risk begins at the
+selector-index register, performs the increment and asynchronous selector read,
+checks the table ID, and reaches `active_table_q`. Synthesis and routing—not the
+RTL text—determine which path is actually worst. A synchronous prefetch stage is
+the fallback if the boundary-only path misses the target.
 
 ## 3. Setup time, hold time, and uncertainty
 
@@ -2454,3 +2456,356 @@ The short rule is:
 rst_n  -> reset the accelerator as a hardware system
 clear  -> empty stream-specific reservoir state for a new job
 ```
+
+---
+
+# Lesson 7: Ready/valid handshakes and backpressure
+
+## 1. Why a handshake is needed
+
+Connected hardware blocks do not always make progress at the same rate. The
+matcher may produce a symbol while the output consumer is temporarily busy, or
+the input producer may offer a byte while the reservoir is full. A ready/valid
+channel lets either side pause without losing or duplicating data.
+
+Every channel has two directions:
+
+- the producer sends `valid` and the payload forward;
+- the consumer sends `ready` backward.
+
+```mermaid
+flowchart LR
+    P["Input producer<br/>software or DMA"]
+    R["Bit reservoir<br/>and controller"]
+    M["Six-table matcher<br/>and result register"]
+    C["Output consumer<br/>software or DMA"]
+
+    P -->|"byte_valid + byte payload"| R
+    R -.->|"byte_ready"| P
+    R -->|"lookup_valid + lookup_bits"| M
+    M -.->|"lookup_ready"| R
+    M -->|"result/symbol valid + payload"| C
+    C -.->|"result/symbol ready"| M
+```
+
+The solid arrows carry work forward. The dotted arrows carry permission
+backward. That backward flow is called **backpressure**.
+
+## 2. The one transfer rule
+
+For any ready/valid channel, a transfer occurs at rising edge `k` exactly when:
+
+```text
+fire[k] = valid[k] AND ready[k]
+```
+
+`fire` is a common informal name for the transfer event; it does not need to be
+an actual port. `valid` and `ready` are levels observed immediately before the
+rising edge.
+
+| `valid` | `ready` | Transfer at the edge? | Meaning |
+|---:|---:|---|---|
+| 0 | 0 | No | No item is offered and the consumer is blocked |
+| 0 | 1 | No | Consumer is ready, but there is no item |
+| 1 | 0 | No | An item is waiting; the channel is stalled |
+| 1 | 1 | Yes | Exactly one item transfers |
+
+Two common misunderstandings are therefore:
+
+- `ready=1` alone does not mean that anything transferred;
+- `valid=1` alone does not permit the producer to discard the item.
+
+If `valid=1` and `ready=1` remain high for four consecutive rising edges, four
+items transfer, one at each edge. `valid` is not required to pulse low between
+items.
+
+## 3. Who owns each signal?
+
+Suppose block A produces data and block B receives it:
+
+| Signal | Driven by | Meaning |
+|---|---|---|
+| `valid` | Producer A | "My payload currently represents a real item" |
+| payload | Producer A | The item being offered |
+| `ready` | Consumer B | "I can accept an item on this edge" |
+
+In our external symbol channel, the accelerator is the producer:
+
+```text
+accelerator -> symbol_valid, symbol, code_length, table_id, symbol_eob
+consumer    -> symbol_ready
+```
+
+This corrects an easy wording mistake: `symbol_ready` does not tell the next
+component whether the accelerator is ready. It is the next component telling
+the accelerator whether **it** can accept the current symbol.
+
+## 4. The stability rule during a stall
+
+Once a producer raises `valid`, it must keep both `valid` and every associated
+payload field stable until a transfer occurs. Therefore:
+
+```text
+valid=1 and ready=0
+    -> do not transfer
+    -> keep valid asserted
+    -> keep the payload unchanged
+    -> do not advance transaction-dependent state
+```
+
+Consider a registered result containing symbol B and length 4. Signals are
+shown immediately before each rising edge:
+
+| Edge | `symbol_valid` | `symbol_ready` | Payload | Transfer? | Result |
+|---|---:|---:|---|---|---|
+| E10 | 1 | 0 | B, length 4 | No | Hold B and do not consume bits |
+| E11 | 1 | 0 | B, length 4 | No | Hold exactly the same item |
+| E12 | 1 | 1 | B, length 4 | Yes | Consumer accepts B; consume 4 bits |
+
+Readiness has nothing to do with longest or shortest Huffman matching. By E10,
+the match has already been calculated and registered. `symbol_ready=0` only
+means that the receiver needs more time before accepting that result.
+
+## 5. How the one-entry matcher result register works
+
+The central equation is in `rtl/huffman_find_simple.sv`:
+
+```systemverilog
+assign lookup_ready = !result_valid || result_ready;
+```
+
+A new request can enter in either of two cases:
+
+1. `!result_valid`: the output register is empty;
+2. `result_ready`: the old result will leave on this edge, so the register can
+   be replaced immediately.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Empty: no lookup request
+    Empty --> Full: lookup transfer / capture result
+    Full --> Full: result_ready = 0 / hold result
+    Full --> Full: result_ready = 1 and lookup_valid = 1 / send old, capture new
+    Full --> Empty: result_ready = 1 and lookup_valid = 0 / send old result
+```
+
+This is an **elastic one-entry buffer**. The important full-and-stalled case is
+implemented by deliberately making no assignments to the result registers:
+
+```systemverilog
+else if (lookup_ready) begin
+    // capture or clear the output register
+end
+// Otherwise every registered result field retains its value.
+```
+
+This holding behavior is why adding the registered output made the simple
+matcher substantially safer. Its cost is a small number of flip-flops and one
+cycle of latency; its benefit is a stable result that survives an arbitrarily
+long downstream stall.
+
+## 6. Ready/valid channels in this accelerator
+
+The simplified design uses the same idea at several boundaries:
+
+| Channel | Producer's offer | Consumer's permission | Payload |
+|---|---|---|---|
+| Dictionary configuration | `dict_wr_en` | `cfg_ready` | table, address, code, symbol, length |
+| Selector configuration | `selector_wr_en` | `cfg_ready` | address and table ID |
+| Compressed input | `byte_valid` | `byte_ready` | `byte_data`, `byte_last` |
+| Matcher request | `lookup_valid` | `lookup_ready` | `lookup_bits` |
+| Matcher result | `result_valid` | `result_ready` | found, symbol, length |
+| Decoded output | `symbol_valid` | `symbol_ready` | symbol, length, table ID, EOB |
+| Reservoir consume command | `consume_valid` | `consume_ready` | consumed length |
+
+Configuration uses a shared enable/ready convention rather than a completely
+independent streaming channel. A write is accepted only when its enable and
+`cfg_ready` are high and its bounds checks pass.
+
+For the input byte channel, the reservoir defines:
+
+```systemverilog
+byte_fire = byte_valid && byte_ready;
+```
+
+Only on `byte_fire` may the reservoir append `byte_data` or remember
+`byte_last`. If `byte_last=1` while the channel is stalled, the producer must
+keep `byte_valid`, `byte_data`, and `byte_last` stable until acceptance.
+
+## 7. The complete output transaction
+
+At the external boundary, the symbol transfer condition is conceptually:
+
+```text
+symbol_fire = symbol_valid AND symbol_ready
+```
+
+The top level also has to prove that the reservoir can remove the matched
+number of bits. Its RTL therefore uses:
+
+```systemverilog
+reservoir_consume_valid = symbol_valid && symbol_ready;
+output_fire = reservoir_consume_valid && reservoir_consume_ready;
+```
+
+`reservoir_consume_valid` is the valid signal for a separate internal consume
+command. It is asserted only after the external consumer agrees to take the
+symbol. For a legal emitted symbol, `match_len` is nonzero and no greater than
+the reservoir's valid-bit count, so `reservoir_consume_ready=1`. Under that
+invariant:
+
+```text
+output_fire = symbol_valid AND symbol_ready
+```
+
+The following state changes only when `output_fire=1`:
+
+- the reservoir removes `match_len` bits;
+- `bits_consumed` increases by `match_len`;
+- `symbols_produced` increases by one;
+- the 50-symbol selector-group counter advances;
+- the selector may advance to the next table; and
+- an accepted EOB may finish the job.
+
+This is why EOB detection alone must not assert `done`. If an EOB is presented
+while `symbol_ready=0`, the consumer has not received it yet. The accelerator
+holds the EOB stable and finishes only on its handshake.
+
+## 8. Peek, consume, and backpressure together
+
+Suppose the reservoir contains 21 valid bits and the registered match has
+`match_len=4`:
+
+```text
+Before acceptance: valid bits = 21
+During a stall:     valid bits = 21
+After acceptance:  valid bits = 21 bits - 4 bits = 17 bits
+```
+
+No matter how many cycles `symbol_ready` remains zero, the reservoir must not
+move. Once the output fires, the matched prefix is consumed exactly once.
+
+Backpressure can propagate all the way to the input:
+
+```mermaid
+flowchart RL
+    C["Output consumer<br/>symbol_ready = 0"]
+    O["Registered match<br/>holds symbol and length"]
+    R["Reservoir<br/>cannot consume"]
+    P["Input producer<br/>eventually sees byte_ready = 0"]
+
+    C -->|"blocks output transfer"| O
+    O -->|"blocks bit consumption"| R
+    R -->|"after free space fills"| P
+```
+
+The reservoir may still accept a few input bytes while it has free space. Once
+it can no longer fit another byte, it lowers `byte_ready`, and the upstream
+producer must hold its next byte. Buffering delays backpressure; it does not
+remove the need for it.
+
+## 9. No-match is still a valid transaction
+
+In the matcher, `result_valid=1` means, "the result register contains the
+answer to an accepted lookup." It does not mean that a code was found.
+
+```text
+result_valid=1, match_found=1 -> valid lookup result containing a symbol
+result_valid=1, match_found=0 -> valid lookup result reporting no match
+```
+
+The top level accepts a no-match result internally and reports an error. Keeping
+transaction validity separate from semantic success prevents a no-match result
+from looking like "the matcher has not answered yet."
+
+## 10. Why the table selection must remain stable
+
+The six-table wrapper routes `result_ready` and the output mux using
+`active_table`. Therefore, the selected table must remain unchanged from an
+accepted lookup until its result is accepted. If it changed during a stall, the
+pending result could be hidden behind another bank and the old bank would not
+receive its ready signal.
+
+Our top level satisfies this contract: it updates the selector index only in
+the `output_fire` branch. Thus the table cannot change while its symbol is
+stalled. A more general reusable wrapper could instead register the table ID
+alongside each accepted request.
+
+## 11. Counting transfers and stalls
+
+Across `C` observed clock cycles, the number of transfers is:
+
+```text
+N_transfers = sum from k=0 to C-1 of (valid[k] AND ready[k])
+```
+
+The number of output-stall cycles is:
+
+```text
+N_output_stall = sum from k=0 to C-1 of
+                 (symbol_valid[k] AND NOT symbol_ready[k])
+```
+
+This second equation is exactly the event counted by `output_stall_cycles` in
+the top-level RTL. Given an observed busy-cycle count, effective symbol rate is:
+
+```text
+effective rate [symbols/s]
+    = symbols_produced [symbols]
+      x f_clock [cycles/s]
+      / cycle_count [cycles]
+```
+
+For example, 100 accepted symbols over 250 cycles at 200 MHz gives:
+
+```text
+effective rate = 100 symbols x 200,000,000 cycles/s / 250 cycles
+               = 80,000,000 symbols/s
+```
+
+Input and output stalls can overlap with each other or with useful buffered
+work. Therefore, use `cycle_count` for exact observed core time rather than
+blindly adding every stall counter to an ideal-cycle estimate.
+
+## 12. Common handshake mistakes
+
+1. Pulsing `valid` for one cycle and dropping it when `ready=0` loses data.
+2. Changing the payload while `valid=1 && ready=0` corrupts the waiting item.
+3. Treating `ready=1` alone as a transfer invents data that was never offered.
+4. Advancing counters when only `valid` is high can count the same stalled item
+   repeatedly.
+5. If a producer waits for `ready` before asserting `valid`, while a consumer
+   waits for `valid` before asserting `ready`, both sides can deadlock.
+6. Combinational paths between ready and valid must not form a loop across
+   connected modules; such loops are both a timing and simulation problem.
+
+## 13. Lesson 7 key facts
+
+1. A transfer occurs only at a rising edge with `valid && ready`.
+2. The producer owns `valid` and payload; the consumer owns `ready`.
+3. A stalled producer holds its valid payload stable for as long as necessary.
+4. Both signals may stay high, producing one transfer on every clock edge.
+5. Backpressure travels opposite the direction of the data.
+6. Registered output state prevents a slow receiver from losing a match.
+7. Huffman bits are consumed only when the corresponding symbol is accepted.
+8. EOB finishes the job on acceptance, not merely on detection.
+9. `result_valid` says an answer exists; `match_found` says what kind of answer
+   it is.
+10. Selector state must not change while the selected bank's result is stalled.
+
+## Understanding check
+
+1. For each pair `valid/ready = 00, 01, 10, 11`, state whether a transfer
+   occurs and describe what the producer must do in the `10` case.
+2. A producer presents symbol A with `valid=1`. The consumer has `ready=0` for
+   two edges and then raises it for the third edge. How many times is A
+   transferred, and when may the producer change the payload?
+3. The reservoir has 28 valid bits. On one edge, an accepted symbol consumes 8
+   bits while an input-byte handshake appends 8 bits. What is the new bit count,
+   and why can both operations happen on the same edge?
+4. Why can `result_valid=1` together with `match_found=0` be a meaningful
+   response rather than a contradiction?
+5. An EOB result is valid, but `symbol_ready=0`. Should `busy`, `done`, the
+   reservoir position, and the EOB payload change? Explain what happens when
+   `symbol_ready` becomes 1.
