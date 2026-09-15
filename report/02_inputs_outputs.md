@@ -315,6 +315,9 @@ T_clk = 1 / 200,000,000 s
       = 5.000 ns/cycle
 ```
 
+The project chooses 200 MHz as a moderate educational FPGA/SoC target: with the
+current `II=2` it gives a round 100 Msymbol/s ceiling while still forcing a real
+discussion of the wide priority path. It is not derived from a selected device.
 The supplied XDC asks an FPGA implementation tool to analyze this requirement:
 
 ```tcl

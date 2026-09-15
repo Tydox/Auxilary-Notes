@@ -114,10 +114,10 @@ flowchart LR
 
     subgraph H["Six table banks"]
         BD["bank decode +<br/>operand isolation"]
-        C0["CAM 0<br/>147 x 47-bit entries"]
-        C1["CAM 1"]
-        CX["CAM 2..4"]
-        C5["CAM 5"]
+        C0["CAM 0 + bank result register<br/>147 x 47-bit entries"]
+        C1["CAM 1 + bank result register"]
+        CX["CAM 2..4 + result registers"]
+        C5["CAM 5 + bank result register"]
         MX["selected-result mux"]
         BD --> C0 --> MX
         BD --> C1 --> MX
@@ -126,11 +126,10 @@ flowchart LR
     end
 
     subgraph O["Commit/output"]
-        QR["registered result<br/>found 1 bit, symbol 9 bits, len 5 bits"]
         CK["capacity + real-bit + EOB checks"]
         OS["symbol_valid/ready: 1 bit each<br/>symbol 9, length 5, table 3, EOB 1 bit"]
         CN["bit/symbol/cycle/stall counters"]
-        QR --> CK --> OS
+        CK --> OS
         CK --> CN
     end
 
@@ -139,7 +138,7 @@ flowchart LR
     AL --> IR
     PK --> BD
     AT --> BD
-    MX --> QR
+    MX --> CK
     OS -.->|output_fire| GI
     OS -.->|consume_len 5 bits| BQ
 ```

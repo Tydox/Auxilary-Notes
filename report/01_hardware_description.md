@@ -29,7 +29,7 @@ benchmark:
 | Reservoir | 32 bits | Holds a 16-bit lookup window plus refill margin |
 | Input stream | 8 bits/cycle | Natural byte-oriented memory/DMA boundary |
 | Output stream | 9-bit symbol plus metadata | Directly supplies the existing software post-processing loop |
-| Clock target | 200 MHz | 5.000 ns target period; requires later timing closure |
+| Clock target | 200 MHz | Moderate course-design target yielding 100 Msymbol/s at II=2; 5.000 ns feasibility still requires device-specific timing closure |
 
 This is a component accelerator, not a complete bzip2 decompressor. Software
 continues to parse headers and Huffman metadata, perform RUNA/RUNB expansion,
@@ -281,6 +281,12 @@ The top provides terminal status and counters:
 | `0x06` | `ERR_SELECTOR` | Invalid or exhausted selector schedule |
 | `0x07` | `ERR_OUTPUT_OVERFLOW` | Symbol capacity was reached before accepted EOB |
 
+The implemented no-match classification uses the registered
+`reservoir_last_seen` flag: it reports `ERR_TRUNCATED` when that flag is set,
+and otherwise reports `ERR_NO_SYMBOL`. Therefore, even a full 16-bit lookup
+window that has no match after the final input byte is classified as
+`ERR_TRUNCATED` by the current RTL.
+
 Counters report logical work rather than merely interface activity:
 
 - `bits_consumed`: sum of code lengths for accepted output symbols;
@@ -354,6 +360,10 @@ not claimed as executed here**, and frequency, area, and power remain analytical
 targets/estimates. This qualification is important: logically complete RTL is
 not the same as verified, synthesizable-on-every-tool, or timing-closed hardware.
 
+The six Python reference tests were executed successfully on 2026-09-14 using
+the bundled Python runtime with a harmless `pyperf` import stub. They validate
+the golden algorithm and measured lookup count, not SystemVerilog execution.
+
 The compact top test does not yet cover the 50-symbol selector transition,
 nonzero `start_bit`, every simultaneous consume/refill case, error paths, or
 exact `cycle_count`. Actual benchmark tables are checked by the Python reference
@@ -372,7 +382,8 @@ The active design intentionally does not provide:
 - a standard bus, cache-coherent port, DMA master, or interrupt output;
 - a separate configuration-clear/epoch command or per-table loaded flag;
   configuration persists until global reset, so software must fully rewrite all
-  6x147 slots and invalidate absent entries before using different tables;
+  6x147 slots, invalidate absent entries, and rewrite the complete used selector
+  prefix before using different configuration;
 - protection against software changing table configuration during a job beyond
   `cfg_ready` and expected adapter behavior; or
 - production reliability features such as ECC, watchdog recovery, formal proof,

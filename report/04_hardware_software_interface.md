@@ -269,10 +269,12 @@ The source pointer passed to DMA becomes `base + byte_offset`, while
 `start_bit` tells the reservoir how many leading bits of its first byte to
 discard.
 
-On completion:
+On completion, compute one new logical position:
 
 ```python
-b.advance_bits(result.bits_consumed)
+old_absolute = b.tellbits()
+new_absolute = old_absolute + result.bits_consumed
+b.seekbits(new_absolute)
 ```
 
 `bits_consumed` begins at the first bit after `start_bit`, so the skipped leading
@@ -284,9 +286,39 @@ not logically consumed. Only `bits_consumed` advances the software reader.
 The original `RBitfield` should not be used unchanged for this integration: its
 copy constructor assigns `count=x.bitfield` around line 36, and its bulk
 `dropbits` calls `self.f._read` around line 67. The optimized reader corrects
-these to `count=x.count` and `f.read`. Add an explicit, tested
-`absolute_tellbits()`/`advance_bits(n)` API to the optimized version rather than
-depending on ambiguous file state.
+these to `count=x.count` and `f.read`, but that direct bulk `f.read` does not
+increment the reader's `count`, so a later `tellbits()` can still become stale.
+Add an explicit, tested `seekbits()`/`advance_bits()` API to the optimized
+version rather than depending on ambiguous file state.
+
+For the benchmark's seekable file, a clear implementation is:
+
+```python
+def seekbits(self, absolute_position):
+    if absolute_position < 0:
+        raise ValueError("negative bit position")
+
+    byte_position, bit_in_byte = divmod(absolute_position, 8)
+    self.f.seek(byte_position)
+    self.count = byte_position
+    self.bits = 0
+    self.bitfield = 0
+
+    if bit_in_byte:
+        self.needbits(8)          # fetches one byte and updates self.count
+        self.readbits(bit_in_byte)  # discards its already-consumed prefix
+
+def advance_bits(self, amount):
+    if amount < 0:
+        raise ValueError("negative advance")
+    self.seekbits(self.tellbits() + amount)
+```
+
+This resets both the underlying file pointer and the software prefetch state to
+the single authoritative logical position. It performs one seek and at most one
+byte refill; it does not loop once per decoded symbol. For a non-seekable source,
+the alternative is a corrected bulk `dropbits` that consumes existing buffered
+bits first and updates `count` for every skipped whole byte.
 
 ## 4.7 Minimal Python API
 
@@ -295,7 +327,7 @@ Use one call per bzip2 Huffman block:
 ```python
 result = accelerator.decode_into(
     compressed=memoryview(full_file_bytes),
-    absolute_bit_position=b.absolute_tellbits(),
+    absolute_bit_position=b.tellbits(),
     tables=tables,
     selectors=selectors_list,
     eob_symbol=symbols_in_use - 1,
@@ -394,7 +426,7 @@ package/header.
 | `0x040` | `SELECTOR_ADDR_LO` | RW | selector image address low |
 | `0x044` | `SELECTOR_ADDR_HI` | RW | selector image address high |
 | `0x048` | `SELECTOR_COUNT` | RW | 1–2966 |
-| `0x04C` | `TABLE_COUNT` | RW | parsed groups, 1–6; wrapper validates selector IDs against it |
+| `0x04C` | `TABLE_COUNT` | RW | parsed bzip2 groups, 2–6; a generic test wrapper may also allow 1 |
 | `0x050` | `DST_ADDR_LO` | RW | destination DMA address low |
 | `0x054` | `DST_ADDR_HI` | RW | destination DMA address high |
 | `0x058` | `DST_CAPACITY` | RW | number of 16-bit symbol slots, includes EOB |
@@ -439,6 +471,12 @@ Useful FIFOs decouple memory bursts from the byte/symbol rate. The source reader
 must not overwrite or re-order bytes; the output writer must not signal final
 completion until its last write response is received.
 
+The core exposes independent dictionary and selector write ports. A minimal
+loader may serialize all 3,848 writes (19.24 us at 200 MHz); a dual-issue loader
+may overlap one table entry with one selector and needs at least 2,966 cycles
+(14.83 us). External DMA fetch/setup is additional and the table image may be
+cached between identical jobs.
+
 For a bus of width `W_bus` bits, frequency `f_bus`, and efficiency `eta`:
 
 ```text
@@ -481,21 +519,27 @@ side is closer to its two-byte-per-two-cycle limit, approximately 200 MB/s at
 
 ## 4.11 Driver responsibilities
 
-A real Linux driver is required only for a real non-coherent device/FPGA system;
-it is not needed for direct RTL simulation. A minimal driver must:
+A real Linux-attached accelerator normally needs a kernel driver or a controlled
+UIO/VFIO-style access path for MMIO, DMA, and interrupts; it is not needed for
+direct RTL simulation. Non-coherent systems additionally require explicit cache
+maintenance. A minimal driver/access layer must:
 
 1. validate ABI version, fixed-width overflow, alignment, pointers, lengths,
    `start_bit`, table/selector limits, EOB, and destination capacity;
 2. validate selectors against the parsed `table_count`, not merely `<6`;
-3. pin/map user buffers or copy them into safe DMA buffers;
-4. obtain DMA/IOMMU addresses and perform required cache synchronization;
-5. program MMIO registers, issue a write barrier, and start the job;
-6. sleep for interrupt completion or poll sticky status;
-7. enforce a timeout and reset/abort safely if hardware wedges;
-8. wait until output writes are drained, then synchronize the destination for
+3. reject overlapping source/destination DMA ranges (and, for the simplest
+   policy, overlap among all four job buffers), because output writes could
+   overwrite compressed/configuration data not yet read; alternatively stage
+   all overlapping input before enabling writes;
+4. pin/map user buffers or copy them into safe DMA buffers;
+5. obtain DMA/IOMMU addresses and perform required cache synchronization;
+6. program MMIO registers, issue a write barrier, and start the job;
+7. sleep for interrupt completion or poll sticky status;
+8. enforce a timeout and reset/abort safely if hardware wedges;
+9. wait until output writes are drained, then synchronize the destination for
    CPU access;
-9. read error/status/counters; and
-10. unmap/unpin resources on every success and error path.
+10. read error/status/counters; and
+11. unmap/unpin resources on every success and error path.
 
 Huffman parsing belongs in userspace, not in the driver. The driver validates
 the packed representation for safety; the Python/C library constructs it.
@@ -552,8 +596,9 @@ sequenceDiagram
     U->>D: Submit one job descriptor
     D->>D: Map/sync buffers and derive DMA addresses
     D->>A: Program addresses, sizes, EOB, start_bit, capacity
-    D->>A: Memory barrier then START
-    A->>C: Load table and selector configuration
+    D->>A: Memory barrier then wrapper START command
+    A->>C: While cfg_ready, load all required table/selectors
+    A->>C: Pulse core start only after configuration completes
     A->>C: Stream compressed bytes
     C->>A: Stream symbols through EOB and counters
     A->>A: Drain destination writes

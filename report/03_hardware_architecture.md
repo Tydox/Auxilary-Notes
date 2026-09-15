@@ -51,27 +51,29 @@ flowchart LR
 
     subgraph MATCH["Six-bank match datapath"]
         DECODE["selected-bank decode<br/>and operand isolation"]
-        CAM0["CAM 0"]
-        CAM1["CAM 1"]
+        CAM0["CAM + priority 0"]
+        REG0["bank result register 0"]
+        CAM1["CAM + priority 1"]
+        REG1["bank result register 1"]
         DOTS["..."]
-        CAM5["CAM 5"]
+        CAM5["CAM + priority 5"]
+        REG5["bank result register 5"]
         RMUX["selected result mux"]
-        DECODE --> CAM0 --> RMUX
-        DECODE --> CAM1 --> RMUX
+        DECODE --> CAM0 --> REG0 --> RMUX
+        DECODE --> CAM1 --> REG1 --> RMUX
         DECODE --> DOTS
-        DECODE --> CAM5 --> RMUX
+        DECODE --> CAM5 --> REG5 --> RMUX
     end
 
     subgraph COMMIT["Commit and output"]
-        REG["registered found,<br/>symbol[8:0], len[4:0]"]
         CHECK["real-bit, capacity,<br/>EOB and error checks"]
         OUT["symbol stream<br/>valid / ready"]
-        REG --> CHECK --> OUT
+        CHECK --> OUT
     end
 
     PEEK --> DECODE
     AT --> DECODE
-    RMUX --> REG
+    RMUX --> CHECK
     OUT -.->|output_fire| GC
     OUT -.->|consume len| BUF
 ```

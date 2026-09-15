@@ -91,12 +91,16 @@ The 60 measured values give:
 
 Warmups are not included in these 60 reported values.
 
-The exact workload counters were obtained by
-[`tools/characterize_workload.py`](../tools/characterize_workload.py) and are
-asserted by [`tests/test_huffman_reference.py`](../tests/test_huffman_reference.py):
-148,271 lookup calls including EOB and 399,360 final decompressed bytes. Since
-EOB terminates rather than advancing to another group, the selector requirement
-is consistent with:
+The exact workload counters were regenerated with
+[`tools/characterize_workload.py`](../tools/characterize_workload.py): six tables,
+147 maximum alphabet/table entries, code lengths 2–15, 2,966 selectors with
+maximum ID 5, 148,271 lookup calls including EOB, 67,562 source bytes, and
+399,360 final decompressed bytes. The tool was extended to report these hardware
+capacity fields and executed successfully on 2026-09-14. The lookup and output
+counts are also asserted by
+[`tests/test_huffman_reference.py`](../tests/test_huffman_reference.py), whose
+six tests passed under the bundled Python runtime. Since EOB terminates rather
+than advancing to another group, the selector requirement is consistent with:
 
 ```text
 N_non_EOB = 148,271 - 1 = 148,270 symbols
@@ -361,7 +365,8 @@ T_input,upper = 67,562 bytes / 200,000,000 bytes/s
 
 This can overlap decode and is shorter than 1.483 ms.
 
-The direct configuration stream performs:
+With a simple loader that serializes dictionary and selector programming, the
+configuration stream performs:
 
 ```text
 C_config = 6*147 table writes + 2,966 selector writes
@@ -373,6 +378,20 @@ T_config,internal = 3,848 / 200,000,000
 
 This excludes CPU/MMIO/DMA setup. Table/selector images total 6,494 bytes and
 can be cached for repeated identical blocks.
+
+The core actually has independent dictionary-write and selector-write ports, so
+a dual-issue loader may drive one of each on the same idle clock:
+
+```text
+C_config,dual = max(6*147, 2,966)
+              = 2,966 cycles
+
+T_config,dual = 2,966 / 200,000,000
+              = 14.83 us
+```
+
+Thus 19.24 us is the conservative single-loader assumption; 14.83 us is the
+internal dual-port lower bound before external setup/transfer effects.
 
 ## 5.10 Component speedup
 

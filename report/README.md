@@ -101,6 +101,11 @@ chapter defines the missing platform wrapper clearly enough to implement later.
 The remaining likely critical paths are the nested comparison/priority network,
 the variable reservoir consume/refill path, and the boundary-only selector read.
 
+Verification status on 2026-09-14: workload characterization completed and all
+six Python reference tests passed. No HDL compiler/simulator or physical
+implementation tool was available, so RTL compilation, simulation, synthesis,
+timing closure, area, and power remain unverified.
+
 ## Executive conclusion
 
 The design trades substantial replicated comparison logic for a simple and
