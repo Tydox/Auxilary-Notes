@@ -8,6 +8,10 @@
 
 ברירת המחדל היא `147` entries, חלון lookup של `16 bits` ו-`symbol` ברוחב `9 bits`. ערכים אלה מותאמים ל-input שנמדד. Decoder כללי יותר עשוי לדרוש parameters גדולים יותר.
 
+### מהו `core`
+
+המונח `core` אינו ראשי תיבות. בהקשר הזה הכוונה היא ליחידת החישוב המרכזית שמבצעת את הפעולה שאותה רוצים להאיץ. אצלנו ה-core הוא ה-module בשם `hardware_dictionary_accelerator`: הוא שומר Huffman table אחד, מבצע את ההשוואות המקביליות ומחזיר `match_symbol` ו-`match_len`. ה-core אינו כולל את כל המערכת שמסביבו. רכיבים כמו MMIO registers, ‏DMA, ‏bit reservoir, ‏FIFO, ‏interrupt logic וה-Driver נמצאים ב-system wrapper או ב-Software. אפשר לחשוב על ה-core כעל “המנוע” שמבצע את החישוב, ועל ה-wrapper כעל החלק שמחבר את המנוע למעבד, לזיכרון ולשאר המערכת.
+
 ## קוד ה-Software שמוחלף ומואץ
 
 ההחלפה הישירה היא של הפונקציה הבאה בשורות `224–235` של
@@ -108,6 +112,18 @@ $$
 
 זהו design target ולא תוצאת מדידה. ה-`timescale 1ns/1ps` בקוד קובע רק את יחידות הזמן של ה-simulation ואינו קובע את תדר העבודה. כדי לדעת את התדר המרבי בפועל צריך לבצע synthesis, ‏place-and-route ו-Static Timing Analysis עבור FPGA או ASIC מוגדרים.
 
+בחרנו ב-`200 MHz` משום שהוא מהווה נקודת התחלה סבירה עבור proof of concept עם `147` comparators, ‏priority logic ו-routing רחב. בנוסף, זהו התדר שמוגדר ב-clock constraint הקיים באמצעות period של `5 ns`. הבחירה אינה אומרת ש-`200 MHz` הוא התדר היחיד האפשרי או שהתכנון כבר הוכח בתדר זה. תדר נמוך יותר, למשל `100 MHz`, מקל על timing closure ומקטין בקירוב את ה-dynamic power, אך גם מקטין את ה-throughput. תדר גבוה יותר, למשל `300 MHz`, יכול להגדיל את ה-throughput, אך מקצר את הזמן המותר ל-critical path ועלול לחייב pipeline נוסף, יותר registers או שינוי ב-priority network.
+
+ערך התדר משפיע על קצב הפענוח, על זמן העבודה ועל צריכת ההספק הדינמית:
+
+$$
+Throughput=\frac{f_{clk}}{II},\qquad
+T_{job}=\frac{C_{job}}{f_{clk}},\qquad
+P_{dynamic}\approx\alpha C V^2f_{clk}
+$$
+
+כל עוד ה-timing constraints מתקיימים, שינוי התדר אינו משנה איזה symbol נבחר אלא רק את הקצב שבו התוצאות מתקבלות. הגבול העליון של התדר נקבע על ידי ה-critical path, ה-routing delay, ה-fan-out, ‏setup time, ‏clock uncertainty, ה-speed grade של ה-device ותנאי voltage ו-temperature. מבחינה פונקציונלית אין ל-core גבול תחתון מיוחד, ולכן בדרך כלל ניתן להפעיל אותו גם בתדר נמוך יותר. עם זאת, מערכת אמיתית עשויה להציב minimum frequency בגלל מגבלות PLL, ‏DMA, ‏memory bandwidth, ‏timeouts או דרישת throughput. לכן `Fmax` ו-minimum system frequency נקבעים רק לאחר בחירת target device וביצוע timing analysis ברמת המערכת.
+
 ## Hardware architecture
 
 בשלב ה-configuration, ה-Software מספק code מיושר לימין באורך `L`. עבור `W=16` ה-core יוצר ושומר:
@@ -182,6 +198,10 @@ flowchart TB
 ### התנהגות cycle-by-cycle
 
 ה-output של ה-core רשום. אם הוא מחובר ל-producer שמסוגל לספק חלונות בלתי תלויים, ניתן לקבל lookup חדש בכל cycle. ב-system wrapper הפשוט, לעומת זאת, החלון הבא תלוי ב-`match_len` של התוצאה הקודמת. לכן הוא ממתין cycle אחד לצריכת ה-bits ומתקבל `II=2`.
+
+### מהו `II`
+
+`II` הוא קיצור של **Initiation Interval**. הוא מציין כמה clock cycles עוברים בין התחלה של שתי פעולות עוקבות. אם `II=1`, ניתן להתחיל lookup חדש בכל cycle; אם `II=2`, ניתן להתחיל lookup חדש פעם בשני cycles. חשוב להבדיל בין `II` לבין latency: ‏latency הוא הזמן מבקשה מסוימת ועד שהתוצאה שלה מופיעה, ואילו `II` קובע באיזו תדירות ניתן להתחיל בקשות חדשות. ה-matcher core יכול לקבל lookups בלתי תלויים ב-`II=1` כאשר `result_ready=1`, אבל ב-wrapper הפשוט החלון הבא תלוי ב-`match_len` של התוצאה הקודמת ולכן הנחנו `II=2`. בהתאם לכך, ב-`200 MHz` מתקבל throughput של $200\text{ MHz}/2=100\text{ Msymbol/s}$.
 
 ```mermaid
 sequenceDiagram
