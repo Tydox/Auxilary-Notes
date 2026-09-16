@@ -122,6 +122,54 @@ T_{job}=\frac{C_{job}}{f_{clk}},\qquad
 P_{dynamic}\approx\alpha C V^2f_{clk}
 $$
 
+כאן `C_job` הוא מספר ה-clock cycles הדרוש לביצוע משימה מסוימת (`job`), ו-`T_job` הוא הזמן בשניות שלוקח להשלים אותה משימה. המונח `job` אינו חייב להיות קובץ שלם: הוא יכול להיות lookup יחיד, פענוח block אחד או כל שלב אחר שאנו מודדים. לדוגמה, אם פענוח block דורש `296,545 cycles` והמאיץ עובד ב-`200 MHz`, אז:
+
+$$
+\begin{aligned}
+C_{job} &= 296{,}545\text{ cycles} \\
+f_{clk} &= 200\text{ MHz}=200{,}000{,}000\text{ cycles/s} \\
+T_{job} &= \frac{C_{job}}{f_{clk}} \\
+        &= \frac{296{,}545\text{ cycles}}
+                 {200{,}000{,}000\text{ cycles/s}} \\
+        &= 0.001482725\text{ s} \\
+        &= 1.482725\text{ ms}
+\end{aligned}
+$$
+
+כאשר מדברים על מספר פעולות הפענוח בשנייה, הכוונה כאן היא למספר ה-Huffman symbols שהמאיץ יכול לזהות, ולא למספר קבצים או blocks שלמים. ה-matcher core לבדו יכול באופן עקרוני לקבל lookup בלתי תלוי בכל cycle (`II=1`), ולכן ב-`200 MHz` הגבול התיאורטי שלו הוא:
+
+$$
+\begin{aligned}
+Throughput_{core} &= \frac{f_{clk}}{II} \\
+                  &= \frac{200{,}000{,}000}{1} \\
+                  &= 200{,}000{,}000\text{ symbols/s} \\
+                  &= 200\text{ Msymbol/s}
+\end{aligned}
+$$
+
+ב-wrapper הפשוט שלנו, החלון הבא תלוי ב-`match_len` של התוצאה הקודמת ולכן ההערכה השמרנית היא `II=2`. במקרה זה, ב-`200 MHz` מתקבלים:
+
+$$
+\begin{aligned}
+Throughput_{system} &= \frac{f_{clk}}{II} \\
+                    &= \frac{200{,}000{,}000}{2} \\
+                    &= 100{,}000{,}000\text{ symbols/s} \\
+                    &= 100\text{ Msymbol/s}
+\end{aligned}
+$$
+
+בהנחה ש-`II=2` נשאר קבוע ושאין stalls, השפעת התדר היא לינארית:
+
+| תדר עבודה | חישוב | קצב פענוח תיאורטי |
+|---:|---:|---:|
+| `100 MHz` | $100{,}000{,}000/2$ | `50 Msymbol/s` |
+| `150 MHz` | $150{,}000{,}000/2$ | `75 Msymbol/s` |
+| `200 MHz` | $200{,}000{,}000/2$ | `100 Msymbol/s` |
+| `250 MHz` | $250{,}000{,}000/2$ | `125 Msymbol/s` |
+| `300 MHz` | $300{,}000{,}000/2$ | `150 Msymbol/s` |
+
+לדוגמה, העלאת התדר מ-`100 MHz` ל-`200 MHz` מכפילה באופן תיאורטי את קצב הפענוח מ-`50` ל-`100 Msymbol/s`, והורדת התדר מ-`200 MHz` ל-`150 MHz` מורידה אותו ל-`75 Msymbol/s`. יחס זה מתקיים רק כל עוד ה-memory, ה-DMA וה-consumer מסוגלים לספק ולקבל מידע בקצב הדרוש, וכל עוד backpressure אינו מוסיף cycles המתנה.
+
 כל עוד ה-timing constraints מתקיימים, שינוי התדר אינו משנה איזה symbol נבחר אלא רק את הקצב שבו התוצאות מתקבלות. הגבול העליון של התדר נקבע על ידי ה-critical path, ה-routing delay, ה-fan-out, ‏setup time, ‏clock uncertainty, ה-speed grade של ה-device ותנאי voltage ו-temperature. מבחינה פונקציונלית אין ל-core גבול תחתון מיוחד, ולכן בדרך כלל ניתן להפעיל אותו גם בתדר נמוך יותר. עם זאת, מערכת אמיתית עשויה להציב minimum frequency בגלל מגבלות PLL, ‏DMA, ‏memory bandwidth, ‏timeouts או דרישת throughput. לכן `Fmax` ו-minimum system frequency נקבעים רק לאחר בחירת target device וביצוע timing analysis ברמת המערכת.
 
 ## Hardware architecture
