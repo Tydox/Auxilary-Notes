@@ -1,6 +1,6 @@
 # האצת Raytracing באמצעות Software–Hardware Co-Design
 
-## מסע הדרגתי מקוד Python סקלרי ל־NumPy batched renderer
+## מסע הדרגתי מעיבוד Ray אחד בכל פעם לעיבוד קבוצות עם NumPy
 
 ### תקציר מנהלים
 
@@ -10,7 +10,20 @@
 
 אחרי ארבעה שלבים מצטברים, זמן הריצה ירד ל־**3.184 שניות** עם `batch size` של 2048. זהו `speedup` של **9.37×** והפחתה של **89.33%** בזמן. במקביל, מספר ה־instructions ירד ב־**90.18%** ומספר ה־cycles ירד ב־**88.62%**. כל שש התמונות השמורות — Original, ‏V1, ‏V2, ‏V3, ‏V4/1024 ו־V4/2048 — זהות `byte-for-byte` ובעלות אותו `SHA-256`.
 
-המחיר של V4 הוא `working set` גדול יותר: `Peak RSS` עלה מכ־36.27 MiB לכ־48.91 MiB. זו בדיוק נקודת המבט של Co-Design: לא כל מדד משתפר יחד. בחרנו להשקיע יותר memory כדי לצמצם בצורה דרמטית interpreter overhead, לחשוף `data-level parallelism`, ולאפשר ל־NumPy להשתמש ב־compiled kernels המתאימים ל־CPU.
+המחיר של V4 הוא שימוש ביותר memory בזמן הריצה: כמות ה־RAM המרבית שנמדדה (`Peak RSS`) עלתה מכ־36.27 MiB לכ־48.91 MiB. בתמורה, Python משקיעה הרבה פחות זמן בניהול objects ובקריאות לפונקציות קטנות, ו־NumPy יכולה לבצע אותה פעולה על קבוצה של rays יחד. זו בדיוק נקודת המבט של Co-Design: לא כל מדד משתפר יחד, ולכן בוחרים פשרה שנותנת את זמן הריצה הטוב ביותר בלי לשנות את התוצאה.
+
+### מילון קצר לפני שמתחילים
+
+כדי שהדוח יהיה נוח לקריאה, הנה המשמעות של כמה מושגים שחוזרים בו:
+
+- **Python object:** ערך ש־Python שומר יחד עם מידע נוסף הדרוש לניהולו. נוח לעבוד כך, אבל הניהול עולה זמן ו־memory.
+- **Temporary object:** object שנוצר לצורך חישוב קצר ומיד אחר כך כבר אינו נחוץ.
+- **Method call:** קריאה לפונקציה השייכת ל־object, לדוגמה `vector.normalized()`. לפני ההרצה Python צריכה למצוא את ה־method ולהכין את הקריאה.
+- **Batch:** קבוצה של rays שמעובדת יחד במקום Ray אחד בכל פעם.
+- **Compiled NumPy code:** פונקציות מוכנות של NumPy שכבר תורגמו לקוד מכונה, ולכן אינן עוברות שורת Python עבור כל מספר.
+- **Instruction:** פעולה בסיסית שה־CPU מבצע. בדרך כלל פחות instructions עבור אותה תוצאה פירושם פחות עבודה.
+- **Cycle:** פעימת שעון של ה־CPU. פחות cycles עבור אותה עבודה בדרך כלל פירושם זמן קצר יותר.
+- **Cache:** memory קטן ומהיר הקרוב ל־CPU. נתונים שנמצאים בו נגישים מהר יותר מנתונים שנמצאים רחוק יותר ב־memory.
 
 ---
 
@@ -29,7 +42,7 @@
 - שמונה אובייקטים בסך הכול ושני מקורות אור.
 - `reflection` רקורסיבי עד ארבע רמות מחושבות; הקריאה הבאה מוחזרת כשחור.
 
-לכל pixel נבנה `primary ray`. הקוד מאתר את הפגיעה הקרובה ביותר, מחשב את נקודת הפגיעה ואת ה־normal, ואז מחבר שלושה רכיבים: `specular reflection`, ‏`Lambert diffuse lighting` ו־`ambient lighting`. אם אין פגיעה, ה־pixel שחור.
+לכל pixel נבנה `primary ray` — קו דמיוני שיוצא מה־Camera ועובר דרך אותו pixel. הקוד מאתר את האובייקט הראשון שהקו פוגש ומחשב את ה־normal, כלומר כיוון היוצא ישר מפני השטח. אחר כך הוא מחבר שלושה רכיבי צבע: `specular reflection` הוא ההשתקפות דמוית־המראה, `diffuse lighting` הוא האור הישיר על המשטח, ו־`ambient lighting` הוא אור בסיסי חלש. `Shadow ray` נוסף בודק אם אובייקט אחר חוסם את הדרך אל האור. אם ה־primary ray אינו פוגע בדבר, ה־pixel שחור.
 
 ```mermaid
 flowchart LR
@@ -63,7 +76,7 @@ $$v=CP\cdot D$$
 
 $$\Delta=r^2-(CP\cdot CP-v^2)$$
 
-ואם $\Delta \ge 0$, נבחר השורש הקטן:
+הערך $\Delta$ אומר אם ה־Ray פוגע ב־Sphere: ערך שלילי פירושו שאין פגיעה. אם $\Delta \ge 0$, נבחר השורש הקטן, ו־$t$ מציין כמה צריך להתקדם לאורך ה־Ray עד נקודת הפגיעה:
 
 $$t=v-\sqrt{\Delta}$$
 
@@ -71,24 +84,30 @@ $$t=v-\sqrt{\Delta}$$
 
 $$C=k_sC_{reflection}+k_d\min\left(1,\sum_{visible}\max(0,L\cdot N)\right)C_{base}+k_aC_{base}$$
 
-ברירת המחדל של `SimpleSurface` היא $k_s=0.2$, ‏$k_d=0.6$, ‏$k_a=0.2$. בכל שלבי האופטימיזציה שמרנו על סדר הפעולות, על `binary64`, על סדר האובייקטים והאורות, ועל חוקי הבחירה של הפגיעה.
+ברירת המחדל של `SimpleSurface` היא $k_s=0.2$, ‏$k_d=0.6$, ‏$k_a=0.2$. בכל שלבי האופטימיזציה שמרנו על סדר הפעולות, על דיוק `float64` של 64 bits, על סדר האובייקטים והאורות, ועל חוקי הבחירה של הפגיעה.
 
 ### 1.3 ספריות ומבני נתונים
 
-הטבלה הבאה מתארת את אבני הבניין. היא איננה טבלת השוואת ביצועים, ולכן החצים והדגשת “הטוב ביותר” אינם רלוונטיים כאן.
+הטבלה מפרטת רק את הספריות ואת מבני הנתונים המרכזיים שבהם הקוד משתמש.
 
-| Component | Original implementation | V4 implementation |
+| Category | Name | Simple purpose |
 |---|---|---|
-| Standard library | `array`, `math` | `array`, `math`, `os` |
-| External libraries | `pyperf` | `pyperf`, `NumPy 2.5.3` |
-| Geometry objects | `Sphere`, `Halfspace` | Same scalar objects, packed once per render |
-| Coordinate objects | `Vector`, `Point`, `Ray` with boxed Python numbers | Same API plus `float64` arrays shaped `(3, N)` in the batched path |
-| Scene storage | List of `(geometry, surface)` tuples; list of lights | Same Scene plus packed geometry, material arrays and Boolean masks |
-| Pixel storage | `array.array('B')`, three bytes per pixel | Unchanged |
-| Execution model | Scalar object-oriented CPython | Single-threaded CPython orchestration plus compiled NumPy elementwise kernels |
-| Output | P6 `PPM` | Byte-compatible P6 `PPM` |
+| Library | `array` | Provides the byte array used for RGB output |
+| Library | `math` | Provides `sqrt`, `tan` and `pi` |
+| Library | `pyperf` | Measures benchmark runtime |
+| Library | `os` | Sets NumPy-related thread limits in V4 |
+| Library | `NumPy 2.5.3` | Processes groups of rays in V4 |
+| Data structure | `Vector`, `Point`, `Ray` | Store directions, positions and rays |
+| Data structure | `Sphere`, `Halfspace` | Represent scene geometry |
+| Data structure | `Scene` | Stores objects, lights and camera settings |
+| Data structure | `SimpleSurface`, `CheckerboardSurface` | Store colour and lighting settings |
+| Data structure | `Canvas`, `array.array('B')` | Store three RGB bytes for every pixel |
+| Data structure | `BatchedRenderer` | Processes groups of rays with NumPy in V4 |
+| Data structure | Python `list` and `tuple` | Store objects, surfaces, lights and colours |
+| Data structure | NumPy `float64` arrays | Store many ray coordinates together in V4 |
+| Data structure | NumPy Boolean arrays | Mark which rays are active, hit or blocked in V4 |
 
-בגרסה המקורית, כל `Vector`, ‏`Point` ו־`Ray` הוא Python object, וכל coordinate הוא Python `float` boxed. פעולות פשוטות כמו חיבור vectors כוללות method dispatch, בדיקות type, allocation של object חדש ועדכוני reference count. ב־V4, הנתונים החמים מאורגנים גם כ־`Structure of Arrays`: לכל batch קיימת מטריצה `(3, N)`, שבה כל עמודה היא Ray. כך coordinates רבים מאותו סוג נמצאים ברצף, וה־CPU יכול לעבד אותם באמצעות compiled array kernels.
+בגרסה המקורית, כל coordinate הוא `float` רגיל של Python שנמצא בתוך `Vector`, ‏`Point` או `Ray`. זה נוח וברור, אבל חיבור או נרמול של vectors יוצר לעיתים object חדש וקורא לכמה methods קטנים. ב־V4, החישובים החמים משתמשים גם במערכים שבהם נמצאים יחד ערכי `x`, ‏`y` ו־`z` של rays רבים. כך NumPy יכולה לבצע פעולה אחת על קבוצה של rays, במקום ש־Python תטפל בכל Ray בנפרד.
 
 ### 1.4 מה נכלל בזמן המדוד?
 
@@ -96,7 +115,7 @@ $$C=k_sC_{reflection}+k_d\min\left(1,\sum_{visible}\max(0,L\cdot N)\right)C_{bas
 
 - יצירה ואתחול של `Canvas`.
 - בניית ה־Scene, האובייקטים, החומרים והאורות.
-- ב־V4, גם יצירת `BatchedRenderer` ואריזת הנתונים.
+- ב־V4, גם יצירת `BatchedRenderer` והמרת נתוני ה־Scene למערכי NumPy.
 - יצירת ה־rays, חישוב החיתוכים, shading וכתיבת pixels ל־Canvas.
 
 כתיבת קובץ ה־`PPM` האופציונלי מתבצעת אחרי עצירת ה־timer, ולכן אינה מנפחת את ה־speedup. כל מדידות ההשוואה שניתנו בוצעו במפורש על 800×800 pixels, גם אם ברירות המחדל ההיסטוריות בחלק מהקבצים שונות.
@@ -123,13 +142,13 @@ $$C=k_sC_{reflection}+k_d\min\left(1,\sum_{visible}\max(0,L\cdot N)\right)C_{bas
 
 ### 2.2 ה־Flame Graph המקורי
 
-ב־Flame Graph, רוחב מסגרת מייצג את חלקה היחסי בדגימות. מסגרות מקוננות הן `inclusive` ולכן אין לחבר את האחוזים שלהן. ה־profiling נעשה עם debug build של Python כדי לקבל stacks ברורים; לכן אנו משתמשים בו לאיתור hotspots, ולא כתחליף לזמני `pyperf`.
+ב־Flame Graph, כל מלבן מייצג function. מלבן רחב יותר פירושו שה־profiler ראה את אותה function לעיתים קרובות יותר, ולכן כדאי לבדוק אותה כמועמדת לאופטימיזציה. מלבן יכול להכיל functions שהוא קרא להן, ולכן האחוזים חופפים ואין לחבר אותם. ה־profiling נעשה עם גרסת Python שמציגה מידע מפורט יותר על הקריאות; לזמני הריצה עצמם אנו משתמשים ב־`pyperf`.
 
 ![Original Raytrace Flame Graph](assets/flamegraph-original.svg)
 
-ה־Flame Graph מספר סיפור עקבי: כמעט כל העבודה נמצאת בתוך `Scene.render`, ורוב העבודה החמה ממשיכה דרך `rayColour`, ‏`colourAt`, בדיקות visibility וחישובי Sphere. הטבלה מדרגת את היעדים לפי חלקם ה־inclusive; כאן חץ למעלה פירושו “יעד חשוב יותר לבדיקה”, לא “קוד מהיר יותר”.
+ה־Flame Graph מספר סיפור עקבי: כמעט כל העבודה נמצאת בתוך `Scene.render`, ורוב העבודה ממשיכה דרך `rayColour`, ‏`colourAt`, בדיקות האם האור חסום וחישובי Sphere. הטבלה מדרגת את ה־functions לפי חלקן בדגימות; כאן חץ למעלה פירושו “יעד חשוב יותר לבדיקה”, לא “קוד מהיר יותר”.
 
-| Original frame | Hotspot priority share (%) ↑ |
+| Original function | Profiler sample share (%) ↑ |
 |---|---:|
 | `Scene.render` | **73.56** |
 | `Scene.rayColour` | 62.73 |
@@ -142,14 +161,14 @@ $$C=k_sC_{reflection}+k_d\min\left(1,\sum_{visible}\max(0,L\cdot N)\right)C_{bas
 
 ### 2.3 מה ראינו מעבר ל־Flame Graph?
 
-בגרסה המקורית נמדדו כ־71.648 billion cycles, ‏186.717 billion instructions ו־30.397 billion branch instructions. ה־IPC היה כ־2.606, וה־CPU היה עסוק כמעט לחלוטין. כלומר, הבעיה לא הייתה CPU “רדום”; הוא עבד הרבה מאוד כדי לבצע שכבות של Python bookkeeping סביב מתמטיקה קטנה.
+בגרסה המקורית נמדדו כ־71.648 billion cycles, ‏186.717 billion instructions ו־30.397 billion branch instructions. ה־CPU היה עסוק כמעט לחלוטין. כלומר, הבעיה לא הייתה CPU “רדום”; הוא ביצע הרבה מאוד פעולות כדי לנהל Python objects וקריאות ל־methods, אף שהמתמטיקה עצמה קצרה יחסית.
 
 מהקוד ומה־profiling זיהינו ארבעה סוגי בזבוז:
 
 1. **חישוב חוזר:** אותם camera components, ‏shadow directions ו־$r^2$ חושבו שוב ושוב.
-2. **temporary objects:** פעולות arithmetic יצרו `Vector`, ‏`Point`, lists ו־tuples קצרי חיים.
-3. **dynamic dispatch:** פעולה מתמטית קצרה עברה דרך מספר methods, בדיקות type ו־Python frames.
-4. **scalar execution:** כל Ray עבר לבדו דרך interpreter, אף על פי ש־rays שונים אינם תלויים זה בזה.
+2. **objects קצרי חיים:** פעולות חשבון יצרו `Vector`, ‏`Point`, lists ו־tuples שנדרשו רק לרגע.
+3. **הרבה קריאות קטנות:** פעולה מתמטית קצרה עברה דרך כמה methods ובדיקות של סוג האובייקט לפני שהסתיימה.
+4. **Ray אחד בכל פעם:** Python עיבדה כל Ray בנפרד, אף על פי ש־rays שונים אינם תלויים זה בזה.
 
 זו הייתה נקודת המפתח: לפני שמנסים “להאיץ את המתמטיקה”, כדאי לצמצם את כל מה שמקיף אותה.
 
@@ -167,28 +186,28 @@ flowchart LR
 
 ## 3. Optimizations — המסע, צעד אחר צעד
 
-כל גרסה נבנתה מעל קודמתה. לא מדובר בארבע חלופות נפרדות, אלא בסדרה מצטברת שבה כל שלב משאיר hotspot אחר לשלב הבא.
+כל גרסה נבנתה מעל קודמתה. לא מדובר בארבע חלופות נפרדות, אלא בסדרה מצטברת: בכל שלב פתרנו בעיה אחת, מדדנו שוב, ואז ראינו מה הפך לחלק האיטי הבא.
 
 ```mermaid
 flowchart LR
-    O["Original: scalar object-oriented rays"] --> V1["V1: remove repeated work and temporary objects"]
-    V1 --> V2["V2: inline four arithmetic helpers"]
-    V2 --> V3["V3: cache radius squared and camera columns"]
-    V3 --> V4["V4: NumPy ray batches, default 2048"]
-    V4 --> Q["Same image semantics, less CPU work per ray"]
+    O["Original: Python processes one ray at a time"] --> V1["V1: reuse calculations and create fewer objects"]
+    V1 --> V2["V2: use fewer small function calls"]
+    V2 --> V3["V3: calculate fixed values once"]
+    V3 --> V4["V4: process groups of rays with NumPy"]
+    V4 --> Q["Same image, much less CPU work"]
 ```
 
 ### 3.1 V1 — קודם כול מפסיקים לבזבז עבודה
 
-השלב הראשון הוא הגדול ביותר מבין האופטימיזציות הסקלריות. הוא לא משנה את האלגוריתם; הוא מסיר עבודה שה־CPU לא היה צריך לבצע מלכתחילה.
+השלב הראשון הוא הגדול ביותר מבין השיפורים שעדיין מעבדים Ray אחד בכל פעם. הוא לא משנה את האלגוריתם; הוא מסיר עבודה שה־CPU לא היה צריך לבצע מלכתחילה.
 
 #### א. `__slots__` ל־Vector, Point ו־Ray
 
-במקום `__dict__` נפרד לכל instance, הוגדרו slots קבועים. הדבר מצמצם pointer chasing ואת עלות ניהול האובייקטים. חשוב לדייק: זה עדיין אינו packed C struct; ה־coordinates עדיין Python numbers boxed. לכן זו אופטימיזציית object layout, לא שינוי representation מלא.
+בדרך כלל, כל instance שומר dictionary פנימי עם שמות השדות שלו. `__slots__` אומר מראש של־`Vector` ול־`Point` יש רק `x`, ‏`y`, ‏`z`, ול־`Ray` יש רק `point` ו־`vector`. לכן Python צריכה לנהל פחות מידע עבור כל object. ערכי ה־coordinates עצמם עדיין נשארים `float` רגילים של Python; רק צורת שמירת השדות נעשתה פשוטה יותר.
 
-#### ב. חישוב Sphere עם scalar locals
+#### ב. חישוב Sphere ישירות עם מספרים מקומיים
 
-במקום ליצור `cp` כ־Vector ולקרוא מספר פעמים ל־`dot`, הקוד טוען את `x`, ‏`y`, ‏`z` ל־locals ומבצע את אותם products וה־sums ישירות. כך נשמר סדר ה־floating-point, אך נחסכים object זמני, method calls ובדיקות type.
+במקום ליצור `cp` כ־Vector ולקרוא מספר פעמים ל־`dot`, הקוד מעתיק את `x`, ‏`y`, ‏`z` למשתנים מקומיים וכותב את אותה נוסחה ישירות. התוצאה המתמטית נשמרת, אך נחסכים object זמני וכמה קריאות ל־methods.
 
 #### ג. Camera components פעם אחת לשורה ולעמודה
 
@@ -196,77 +215,77 @@ flowchart LR
 
 $$2WH-W-H=1{,}278{,}400$$
 
-temporary vectors, בנוסף ל־arithmetic ול־dispatch הנלווים להם.
+Vector objects קצרי חיים, בנוסף לחיבורים ולכפלים שנדרשו כדי ליצור אותם.
 
-#### ד. מציאת הפגיעה הקרובה תוך כדי traversal
+#### ד. מציאת הפגיעה הקרובה באותה לולאה
 
-המקור בנה list של שמונה tuples לכל Ray ורק אחר כך סרק אותה באמצעות `firstIntersection`. ב־V1, `rayColour` שומר תוך כדי הסריקה את ה־time, object וה־surface הקרובים ביותר. נשמרים בדיוק `t > -EPSILON`, השוואת `<` קשיחה, סדר האובייקטים והעדפת האובייקט הראשון במקרה של tie.
+המקור בנה list של שמונה tuples לכל Ray ורק אחר כך עבר עליה שוב באמצעות `firstIntersection`. ב־V1, `rayColour` בודק כל object פעם אחת ושומר מיד את הפגיעה הקרובה ביותר. כללי הבחירה נשארו זהים: אותו `EPSILON`, אותו סדר אובייקטים ואותה בחירה באובייקט הראשון במקרה של tie.
 
 #### ה. Shadow Ray אחד לכל light
 
-במקור, אותו `Ray(p, light-p)` נבנה ועבר normalization מחדש עבור כל object, ולאחר visibility בוצע normalization נוסף לצורך Lambert. ב־V1 נבנה Shadow Ray אחד לכל צמד point/light, משתמשים בו לכל בדיקות החסימה, ואז מעבירים את אותו normalized direction ל־shading.
+במקור, אותו `Ray(p, light-p)` נבנה מחדש עבור כל object, ובכל פעם כיוון ה־Ray הומר לאורך 1. לאחר שנמצא שהאור אינו חסום, אותה המרה בוצעה שוב לצורך התאורה. ב־V1 נבנה Shadow Ray אחד לכל צמד point/light, משתמשים בו לכל בדיקות החסימה, ואז משתמשים שוב באותו כיוון בתאורה.
 
 #### ו. הסרת פעולה שלא השפיעה על התוצאה
 
-ב־`CheckerboardSurface`, הקריאה `v.scale(1.0 / checkSize)` החזירה Vector חדש אך התוצאה נזרקה. הסרתה אינה משנה את הדוגמה המצוירת; היא רק מפסיקה לבצע allocation ו־arithmetic חסרי השפעה. לכן גם ההתנהגות ההיסטורית שבה `checkSize` אינו אפקטיבי נשמרת.
+ב־`CheckerboardSurface`, הקריאה `v.scale(1.0 / checkSize)` יצרה Vector חדש, אבל הקוד לא שמר אותו ולא השתמש בו. הסרת הקריאה אינה משנה את הדוגמה המצוירת; היא רק מפסיקה ליצור object ולבצע חישוב חסרי השפעה. לכן גם ההתנהגות ההיסטורית שבה `checkSize` אינו אפקטיבי נשמרת.
 
-**התוצאה:** זמן הריצה ירד מ־29.833 ל־13.637 שניות — `speedup` של 2.19× והפחתה של 54.29%. גם ה־instructions ירדו בכ־55.56% לעומת Original. זהו אישור חזק לכך שה־hotspot האמיתי היה כמות העבודה הדינמית של Python, ולא נוסחת חיתוך חדשה שחסרה לנו.
+**התוצאה:** זמן הריצה ירד מ־29.833 ל־13.637 שניות — `speedup` של 2.19× והפחתה של 54.29%. גם ה־instructions ירדו בכ־55.56% לעומת Original. זהו אישור חזק לכך שרוב הזמן התבזבז על חישובים חוזרים וניהול objects, ולא מפני שהיה חסר אלגוריתם חיתוך חדש.
 
 ### 3.2 V2 — מקצרים את הדרך למתמטיקה
 
-אחרי V1, ה־Flame Graph עדיין נראה סקלרי: ה־Ray עובר דרך `normalized`, ‏`pointAtTime`, ‏`normalAt` ו־`reflectThrough`. כל helper קטן בפני עצמו, אבל הוא נקרא פעמים רבות מאוד.
+אחרי V1, כל Ray עדיין עבר לבדו דרך `normalized`, ‏`pointAtTime`, ‏`normalAt` ו־`reflectThrough`. כל פונקציה קטנה בפני עצמה, אבל היא נקראת פעמים רבות מאוד.
 
-V2 מבצע manual inlining בארבעה helpers:
+ב־V2 כתבנו את הנוסחה ישירות בתוך ארבע פונקציות חמות, במקום להרכיב אותה משרשרת של פונקציות קטנות:
 
-- `Vector.normalized` מחשב ישירות $x^2+y^2+z^2$, ‏`sqrt`, reciprocal ושלושה products, בלי לעבור דרך `magnitude → dot → scale`.
-- `Vector.reflectThrough` משתמש ב־`dot` אך יוצר רק Vector תוצאה אחד, במקום שלושה temporary vectors.
-- `Ray.pointAtTime` יוצר ישירות Point סופי, בלי `scale` זמני ו־overloaded addition.
-- `Sphere.normalAt` מחבר displacement ו־normalization ויוצר רק את ה־normal הסופי.
+- `Vector.normalized` מחשב ישירות $x^2+y^2+z^2$, ‏`sqrt`, חלוקה ושלוש פעולות כפל, בלי לעבור דרך `magnitude → dot → scale`.
+- `Vector.reflectThrough` משתמש ב־`dot` אך יוצר רק Vector תוצאה אחד, במקום שלושה Vector objects זמניים.
+- `Ray.pointAtTime` יוצר ישירות את ה־Point הסופי, בלי ליצור קודם Vector נוסף.
+- `Sphere.normalAt` מחשב את הכיוון ואת אורכו במקום אחד ויוצר רק את ה־normal הסופי.
 
-לא “פישטנו” את המתמטיקה בדרך שעלולה לשנות rounding. לדוגמה, `Sphere.normalAt` עדיין מבצע normalization ולא division ברדיוס, ו־reflection שומר על שתי פעולות הכפל המקוריות.
+לא שינינו את סדר פעולות החשבון, כדי לא לשנות אפילו הבדלי rounding קטנים. לדוגמה, `Sphere.normalAt` עדיין מנרמל את ה־Vector ולא פשוט מחלק ברדיוס, ו־reflection שומר על שתי פעולות הכפל המקוריות.
 
-מבחינת hardware, המשמעות היא פחות Python frames, פחות indirect calls, פחות allocations ופחות reference-count updates. זמן הריצה ירד מ־13.637 ל־12.734 שניות — שיפור נוסף של 6.62%, ו־speedup מצטבר של 2.34×.
+מבחינת hardware, המשמעות פשוטה: Python מבצעת פחות קריאות לפונקציות ויוצרת פחות objects זמניים כדי להגיע לאותה תשובה. זמן הריצה ירד מ־13.637 ל־12.734 שניות — שיפור נוסף של 6.62%, ו־speedup מצטבר של 2.34×.
 
-### 3.3 V3 — מעבירים invariants מחוץ ללולאה החמה
+### 3.3 V3 — מחשבים פעם אחת ערכים שאינם משתנים
 
 בשלב זה נשארו שתי פעולות קטנות אך חוזרות:
 
 1. `radius * radius` חושב בכל בדיקת Sphere, אף שהרדיוס קבוע.
 2. הביטוי `eye.vector + horizontalOffset` חושב לכל pixel, אף שהוא קבוע לאורך column.
 
-לכן V3 מוסיף `radiusSquared` בזמן בניית כל Sphere, ושומר לכל column את `eye.vector + horizontalOffset`. ב־800×800, cache של הביטוי השני חוסך:
+לכן V3 מוסיף `radiusSquared` בזמן בניית כל Sphere, ושומר לכל column את `eye.vector + horizontalOffset`. ב־800×800, שמירת הביטוי השני חוסכת:
 
 $$WH-W=639{,}200$$
 
-Vector constructions ועוד 1,917,600 coordinate additions בכל render. החישוב המקדים עדיין נמצא בתוך האזור המדוד, ולכן לא “החבאנו” עבודה מחוץ ל־timer.
+יצירות של Vector objects ועוד 1,917,600 חיבורים של coordinates בכל render. החישוב המקדים עדיין נמצא בתוך הזמן המדוד, ולכן לא “החבאנו” עבודה מחוץ למדידה.
 
-זהו מקרה קלאסי של `loop-invariant code motion`: מעט storage נוסף מחליף הרבה חישובים חוזרים. ההנחה היא שה־Scene סטטי; שינוי `radius` אחרי construction היה מחייב עדכון גם של `radiusSquared`.
+הרעיון כאן פשוט: ערך שאינו משתנה בתוך לולאה צריך לחשב פעם אחת לפני הלולאה, ולא שוב בכל סיבוב. מעט memory נוסף מחליף הרבה חישובים חוזרים. ההנחה היא שה־Scene סטטי; אם משנים `radius` אחרי יצירת ה־Sphere, צריך לעדכן גם את `radiusSquared`.
 
 זמן הריצה ירד מ־12.734 ל־12.076 שניות — שיפור נוסף של 5.17% ו־speedup מצטבר של 2.47×.
 
 ### 3.4 V4 — משנים את צורת העבודה כדי להתאים ל־hardware
 
-שלושת השלבים הראשונים הפכו את הקוד הסקלרי ליעיל בהרבה, אך כל Ray עדיין עבר בנפרד דרך CPython. כאן הגיע השינוי הגדול: במקום לבקש מה־interpreter לבצע אותה פעולה עבור Ray אחד בכל פעם, V4 מרכז rays בלתי תלויים ל־batches ומעביר את ה־arithmetic ל־NumPy.
+שלושת השלבים הראשונים הפכו את הקוד ליעיל בהרבה, אך Python עדיין עיבדה כל Ray בנפרד. כאן הגיע השינוי הגדול: V4 אוספת rays בלתי תלויים לקבוצות (`batches`), ו־NumPy מבצעת את אותו חישוב על כל הקבוצה.
 
 `BatchedRenderer` נוצר בתוך ה־timer ומבצע:
 
-- packing של geometry, חומרים ואורות פעם אחת לכל render.
-- אחסון coordinates במערכים `float64` בצורת `(3, N)` — rays בעמודות.
-- יצירת primary rays בסדר row-major ב־batches עוקבים, כולל batch אחרון קצר.
-- intersection לכל object על כל ה־rays הפעילים באמצעות elementwise operations.
-- שמירת object order, strict comparisons ו־first-object tie behavior.
+- המרה של נתוני האובייקטים, החומרים והאורות למערכי NumPy פעם אחת לכל render.
+- אחסון coordinates במערך `float64` בצורת `(3, N)`: שורה אחת ל־`x`, שורה אחת ל־`y`, שורה אחת ל־`z`, וכל עמודה מייצגת Ray.
+- יצירת primary rays לפי סדר ה־pixels בתמונה, בקבוצות עוקבות ובקבוצה אחרונה קצרה במידת הצורך.
+- חישוב זמן הפגיעה בכל object עבור כל ה־rays שעדיין פעילים.
+- שמירת אותו סדר אובייקטים ואותה בחירה באובייקט הראשון כאשר שתי פגיעות שוות.
 - סינון rays שכבר נחסמו לפני בדיקת ה־shadow object הבא.
-- recursion על subsets של rays לצורך reflection.
+- שימוש במערכי `True/False` כדי לסמן אילו rays פגעו, נחסמו או עדיין זקוקים ל־reflection.
 - שמירת סדר הצבירה: reflection, אחר כך diffuse, אחר כך ambient.
-- העברת הצבעים דרך `Canvas.plot` המקורי כדי לשמור בדיוק על truncation, clamp וכיוון התמונה.
+- העברת הצבעים דרך `Canvas.plot` המקורי כדי לשמור בדיוק על אותו חיתוך ספרות, אותה הגבלה לטווח 0…255 ואותו כיוון תמונה.
 
 ```mermaid
 flowchart LR
-    I["Input: independent scalar rays"]:::input --> P["Pack coordinates as SoA (3, N)"]
-    P --> B["Process one software batch"]
-    B --> U["Compiled NumPy elementwise kernels"]
-    U --> F["Masks, hit subsets and recursive shading"]
-    F --> C["Original Canvas.plot conversion"]
+    I["Input: independent rays"]:::input --> P["Store ray coordinates in arrays"]
+    P --> B["Process one group of rays"]
+    B --> U["NumPy performs the calculations"]
+    U --> F["Keep active rays and calculate reflections"]
+    F --> C["Convert colours to RGB"]
     C --> O["Output: byte-identical RGB pixels"]:::output
     classDef input fill:#ffd6d6,stroke:#b91c1c,color:#111
     classDef output fill:#d9fdd3,stroke:#15803d,color:#111
@@ -274,30 +293,30 @@ flowchart LR
 
 #### למה זהו Co-Design גם בלי RTL?
 
-האלגוריתם נשאר אותו Raytracer, אבל ה־software מציג אותו ל־hardware בצורה שונה:
+האלגוריתם נשאר אותו Raytracer, אבל הקוד מוסר את העבודה ל־CPU בצורה נוחה יותר:
 
-- `SoA` הופך coordinates של rays רבים לרציפים יותר ב־memory.
-- call אחד ל־NumPy מחליף מאות או אלפי iterations דרך Python bytecode.
-- compiled kernels יכולים להשתמש ב־SIMD וב־instruction selection של ספריית NumPy עבור ה־CPU הקיים.
-- overhead של dispatch, masks ו־allocation מתחלק על יותר rays.
-- `batch size` הוא software tile, לא רוחב SIMD. הוא קובע איזון בין amortization לבין `working set` ו־cache pressure.
+- coordinates של rays רבים נשמרים יחד במערכי NumPy.
+- קריאת NumPy אחת מחליפה מאות או אלפי סיבובי לולאה של Python.
+- NumPy משתמשת בפונקציות מהירות שכבר קומפלו לקוד מכונה. חלקן יכולות להשתמש ב־SIMD — instruction יחיד של CPU שמטפל בכמה מספרים יחד.
+- עלות ההכנה של כל קריאה מתחלקת בין rays רבים.
+- `batch size` הוא פשוט מספר ה־rays שמעובדים יחד. Batch גדול חוסך קריאות ל־NumPy, אבל דורש arrays זמניים גדולים יותר.
 
-ב־profiling נצפו symbols כגון `DOUBLE_multiply_X86_V3`, ‏`DOUBLE_add_X86_V3` ו־`DOUBLE_subtract_X86_V3`. זו עדות לכך שנבחרו compiled x86-v3 kernels. אין כאן ספירה ישירה של SIMD instructions, ולכן איננו טוענים שכל פעולה רצה במסלול SIMD מסוים.
+ב־profiling נצפו שמות כמו `DOUBLE_multiply_X86_V3`, ‏`DOUBLE_add_X86_V3` ו־`DOUBLE_subtract_X86_V3`. השמות מראים ש־NumPy בחרה פונקציות חישוב שהותאמו למשפחת ה־CPU. עם זאת, לא ספרנו ישירות SIMD instructions, ולכן איננו טוענים שכל פעולה השתמשה ב־SIMD.
 
-כל משתני ה־threading הנפוצים מוגבלים ל־1 לפני import של NumPy, וה־kernels כאן אינם BLAS. לכן V4 נשארת single-core; ההאצה מגיעה מ־vectorized native execution ומפחות interpreter work, לא מ־multithreading.
+מספר ה־threads הוגבל ל־1 לפני טעינת NumPy. לכן V4 משתמשת ב־CPU core אחד בלבד, וה־speedup לא הגיע מ־cores נוספים. הוא הגיע מכך ש־NumPy מבצעת חישובים רבים בקוד מכונה, בעוד Python מנהלת פחות עבודה לכל Ray.
 
-ברירת המחדל הסופית היא `batch size = 2048`. מערך coordinates יחיד בגודל `3 × 2048 × 8` bytes תופס כ־48 KiB, לעומת כ־24 KiB עבור 1024; בפועל קיימים כמה arrays ו־temporaries יחד. לכן היה חשוב למדוד את שני הגדלים במקום לנחש.
+ברירת המחדל הסופית היא `batch size = 2048`. מערך coordinates יחיד בגודל `3 × 2048 × 8` bytes תופס כ־48 KiB, לעומת כ־24 KiB עבור 1024. מכיוון שבזמן החישוב קיימים כמה arrays יחד, batch גדול יותר יכול להשתמש ביותר memory. לכן מדדנו את שני הגדלים במקום לנחש.
 
 עם 2048, זמן הריצה ירד מ־12.076 שניות ב־V3 ל־3.184 שניות — שיפור של 3.79× בשלב אחד, והפחתה של 73.64% בזמן לעומת V3.
 
 ### 3.5 סיכום רעיוני של ארבעת השלבים
 
-| Stage | Bottleneck found | Software change | Hardware-facing effect |
+| Stage | Problem found | Change made | Result for the CPU |
 |---|---|---|---|
-| V1 | Repeated work, temporary objects, hit lists and repeated shadow normalization | Reuse values, traverse once, add slots, scalarize sphere math | Fewer dynamic instructions, branches, allocations and pointer dereferences |
-| V2 | Short arithmetic expressed through long Python call chains | Inline four hot helpers while preserving operation order | Less dispatch, frame creation and reference-count traffic |
-| V3 | Loop-invariant values recomputed in hot loops | Cache radius squared and per-column camera terms | Fewer ALU operations, objects and memory writes |
-| V4 | Independent rays still executed one by one by CPython | Pack rays into NumPy batches using SoA data | Amortized dispatch, compiled kernels and exposed data-level parallelism |
+| V1 | Repeated calculations and many temporary objects | Reuse values, scan objects once and calculate sphere values directly | Fewer Python operations and object creations |
+| V2 | Small calculations required many Python function calls | Write four formulas directly where they are used | Fewer function calls and temporary objects |
+| V3 | Constant values were recalculated inside loops | Calculate radius and camera values once | Fewer repeated calculations |
+| V4 | Python still processed one ray at a time | Group rays in NumPy arrays and process them together | Much less Python work per ray |
 
 ---
 
@@ -307,7 +326,7 @@ flowchart LR
 
 הערכים נלקחו ישירות מ־`timing.json`. כל השורות משתמשות ב־800×800 pixels. V4 מופיעה בשני גדלי batch כנדרש; בכל שאר הדיון V4 מתייחסת כברירת מחדל ל־2048.
 
-| Version | Runtime (s) ↓ | Speedup vs Original (×) ↑ | Time reduction vs Original (%) ↑ | Peak RSS (MiB) ↓ |
+| Version | Runtime (s) ↓ | Speedup vs Original (×) ↑ | Time reduction vs Original (%) ↑ | Maximum RAM (MiB) ↓ |
 |---|---:|---:|---:|---:|
 | Original | 29.833 | 1.00 | 0.00 | **36.27** |
 | V1 | 13.637 | 2.19 | 54.29 | 36.39 |
@@ -324,7 +343,7 @@ xychart-beta
     bar [29.833, 13.637, 12.734, 12.076, 3.862, 3.184]
 ```
 
-הגרף ממחיש שני פרקים שונים בסיפור: V1 מסירה חלק גדול מה־Python overhead בבת אחת; V2 ו־V3 ממשיכות לשפר את המסלול הסקלרי; V4 משנה את granularity של העבודה ומביאה קפיצה נוספת.
+הגרף ממחיש שני פרקים שונים בסיפור: V1 מסירה הרבה פעולות ניהול מיותרות של Python בבת אחת; V2 ו־V3 ממשיכות לצמצם חישובים וקריאות; V4 מעבדת rays רבים יחד ומביאה קפיצה נוספת.
 
 ### 4.2 התרומה של כל שלב לעומת קודמו
 
@@ -340,16 +359,24 @@ xychart-beta
 
 ### 4.3 מדוע 2048 נבחר כברירת המחדל?
 
-| Batch size | Runtime (s) ↓ | Speedup vs Original (×) ↑ | Speedup vs 1024 (×) ↑ | Cycles (B) ↓ | Instructions (B) ↓ | Peak RSS (MiB) ↓ |
+| Batch size | Runtime (s) ↓ | Speedup vs Original (×) ↑ | Speedup vs 1024 (×) ↑ | Cycles (B) ↓ | Instructions (B) ↓ | Maximum RAM (MiB) ↓ |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1024 | 3.862 | 7.72 | 1.00 | 9.715 | 21.010 | 48.97 |
 | 2048 | **3.184** | **9.37** | **1.21** | **8.150** | **18.345** | **48.91** |
 
-2048 קצר ב־17.57% בזמן לעומת 1024, עם 16.10% פחות cycles ו־12.69% פחות instructions. `Peak RSS` כמעט זהה. במקרה הזה, amortization טוב יותר גבר על העלייה בגודל ה־batch, ולכן 2048 היא הבחירה הנכונה לנתונים שנמדדו.
+2048 קצר ב־17.57% בזמן לעומת 1024, עם 16.10% פחות cycles ו־12.69% פחות instructions. כמות ה־RAM המרבית שנמדדה כמעט זהה. ב־2048 העלות הקבועה של כל קריאת NumPy מתחלקת בין יותר rays. במקרה שנמדד, החיסכון הזה היה גדול יותר מהעלות של arrays גדולים יותר, ולכן 2048 היא הבחירה הנכונה.
 
 ### 4.4 Hardware counters לאורך המסע
 
-הטבלה מציגה counts כוללים מתוך `perf stat`. `B` הוא billions ו־`M` הוא millions. האירועים נאספו ב־multiplexing, ולכן counts הם estimates scaled; שינויים גדולים ועקביים שימושיים, אך אין לפרש הבדלים קטנים בדיוק cycle-level.
+לפני הטבלה, הנה פירוש פשוט של העמודות:
+
+- `Cycles` הן פעימות השעון שעברו בזמן העבודה.
+- `Instructions` הן פעולות בסיסיות שה־CPU ביצע.
+- `Branch instructions` הן נקודות החלטה בקוד, ו־`branch misses` הן החלטות שה־CPU ניחש לא נכון ונאלץ לתקן.
+- `L1D` הוא ה־data cache הקרוב והמהיר ביותר של ה־CPU.
+- `IPC` הוא מספר ה־instructions הממוצע שהסתיימו בכל cycle. ערך גבוה לבדו אינו מבטיח זמן ריצה נמוך, מפני שחשוב גם כמה instructions יש בסך הכול.
+
+הטבלה מציגה את הסכומים מתוך `perf stat`. האות `B` פירושה billion והאות `M` פירושה million. ה־CPU אינו יכול למדוד את כל האירועים בו־זמנית, ולכן `perf` עבר ביניהם והעריך את הסכומים. ההבדלים הגדולים שימושיים, אך אין לייחס משמעות רבה להבדלים קטנים.
 
 | Version | Cycles (B) ↓ | Instructions (B) ↓ | Branch instructions (B) ↓ | Branch misses (M) ↓ | L1D loads (B) ↓ | L1D misses (M) ↓ | IPC ↑ |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -360,7 +387,7 @@ xychart-beta
 | V4, batch 1024 | 9.715 | 21.010 | 3.579 | 24.252 | 4.304 | 213.002 | 2.163 |
 | V4, batch 2048 | **8.150** | **18.345** | **3.140** | **18.213** | **3.799** | **201.150** | 2.251 |
 
-התובנה החשובה היא שה־IPC הגבוה ביותר דווקא שייך ל־Original, והיא עדיין הגרסה האיטית ביותר. V4 אינה מנצחת מפני שכל cycle “עושה יותר”; היא מנצחת מפני שהיא מבקשת מה־CPU לבצע הרבה פחות עבודה דינמית. Original → V4/2048 נותן:
+התובנה החשובה היא שה־IPC הגבוה ביותר דווקא שייך ל־Original, והיא עדיין הגרסה האיטית ביותר. V4 אינה מנצחת מפני שכל cycle “עושה יותר”; היא מנצחת מפני שבסך הכול ה־CPU מקבל הרבה פחות instructions לבצע. Original → V4/2048 נותן:
 
 - 90.18% פחות instructions.
 - 88.62% פחות cycles.
@@ -369,15 +396,15 @@ xychart-beta
 - 91.16% פחות L1D loads.
 - 65.67% פחות L1D misses במספר מוחלט.
 
-מצד שני, `L1D miss rate` עולה מ־1.36% ל־5.29%, ו־Peak RSS עולה ב־34.84%. גם ה־generic `cache-references` עולים מ־45.85M ל־78.68M וה־generic `cache-misses` מ־189.9K ל־671.8K. כלומר, NumPy batches מפחיתים מאוד את סך ה־instructions והגישות מסוגים מסוימים, אבל מפעילים arrays ו־temporaries גדולים יותר ומגדילים memory pressure. זוהי trade-off אמיתית ולא כישלון: זמן הריצה הכולל עדיין קטן פי 9.37.
+מצד שני, אחוז הפעמים שבהן הנתון לא נמצא ב־L1D cache עולה מ־1.36% ל־5.29%, וכמות ה־RAM המרבית עולה ב־34.84%. הסיבה היא שב־V4 קיימים arrays זמניים גדולים יותר. למרות זאת, סך ה־instructions וה־cycles קטן כל כך שזמן הריצה הכולל עדיין משתפר פי 9.37.
 
 ### 4.5 ה־Flame Graph לאחר V4
 
 ![V4 2048 Raytrace Flame Graph](assets/flamegraph-v4-2048.svg)
 
-ב־V4/2048, ה־frames הסקלריים של `rayColour`, ‏`colourAt`, ‏`visibleLights` ו־`Sphere.intersectionTime` אינם שולטים עוד בגרף. `BatchedRenderer.render` מופיע ב־58.72% inclusive, ואילו `Canvas.plot` — שנשאר לולאת Python לפי pixel כדי לשמר את ההמרה המקורית — מגיע ל־45.45%. `BatchedRenderer.rayColours` עצמו מופיע בכ־2.43%, וה־helpers הבודדים מתחת ל־1% כל אחד.
+ב־V4/2048, ה־functions שטיפלו בכל Ray בנפרד — `rayColour`, ‏`colourAt`, ‏`visibleLights` ו־`Sphere.intersectionTime` — כבר אינן החלק המרכזי בגרף. `BatchedRenderer.render` מופיע ב־58.72% מהדגימות, ואילו `Canvas.plot` — שעדיין כותבת pixel אחד בכל פעם ב־Python כדי לשמר את ההמרה המקורית — מגיעה ל־45.45%. `BatchedRenderer.rayColours` עצמו מופיע בכ־2.43%, וכל אחת מהפונקציות הקטנות שלו מתחת ל־1%.
 
-זהו רגע חשוב בסיפור: האופטימיזציה לא “מעלימה זמן”; היא מזיזה את צוואר הבקבוק. אחרי שה־math עבר ל־batches, conversion וכתיבת pixels אחד־אחד הפכו ליעד הבא האפשרי. זו המחשה מעשית של Amdahl’s law.
+זהו רגע חשוב בסיפור: לאחר שמאיצים חלק אחד, חלק אחר שלא השתנה הופך למגבלה החדשה. אחרי שהחישובים עברו ל־batches, המרת הצבע וכתיבת pixels אחד־אחד הפכו ליעד הבא האפשרי.
 
 ### 4.6 Original מול התוצאה הסופית
 
@@ -389,7 +416,7 @@ xychart-beta
 | Instructions (B) ↓ | 186.717 | **18.345** | **−90.18%** | ↓ |
 | Branch instructions (B) ↓ | 30.397 | **3.140** | **−89.67%** | ↓ |
 | L1D loads (B) ↓ | 42.988 | **3.799** | **−91.16%** | ↓ |
-| Peak RSS (MiB) ↓ | **36.27** | 48.91 | +34.84% | ↓ |
+| Maximum RAM (MiB) ↓ | **36.27** | 48.91 | +34.84% | ↓ |
 
 ---
 
@@ -397,7 +424,7 @@ xychart-beta
 
 ### 5.1 בדיקת התוצר בפועל
 
-לכל גרסה נשמר קובץ `raytrace.ppm` של 800×800. כל ששת הקבצים הם באותו גודל ובעלי אותו `SHA-256`. מכיוון ש־cryptographic hash חושב על כל bytes של הקובץ, זו הוכחה ישירה שהתוצרים השמורים זהים `byte-for-byte`, כולל header, סדר pixels וערכי RGB.
+לכל גרסה נשמר קובץ `raytrace.ppm` של 800×800. ‏`SHA-256` הוא מעין טביעת אצבע המחושבת מכל ה־bytes בקובץ. לכל ששת הקבצים יש אותו גודל ואותה טביעת אצבע, ולכן התוצרים השמורים זהים `byte-for-byte`, כולל ה־header, סדר ה־pixels וערכי RGB.
 
 | Version | File size (bytes) | SHA-256 | Result |
 |---|---:|---|---|
@@ -410,37 +437,34 @@ xychart-beta
 
 גודל הקובץ מתאים בדיוק ל־15 bytes של header ועוד $800\cdot800\cdot3=1{,}920{,}000$ bytes של RGB.
 
-### 5.2 כללים סמנטיים שנשמרו במכוון
+### 5.2 פרטים טכניים שנשמרו במכוון
 
-השוואת התמונה היא השורה התחתונה, אך הקוד גם שומר במפורש על הפרטים העדינים הבאים:
+ה־hash הזהה הוא ההוכחה החשובה ביותר. הכללים הבאים מסבירים כיצד שמרנו על אותה תמונה:
 
-- אותו smaller Sphere root ואותו סדר arithmetic.
-- `t > -EPSILON` עבור hit ו־`t > EPSILON` עבור shadow.
-- strict `<` וסדר objects, ולכן אותו winner במקרה של tie.
-- אותו סדר lights ואותו סדר צבירת reflection, diffuse ו־ambient.
-- אותו reflection cutoff.
-- אותו camera convention שבו `halfHeight = 0.75 × halfWidth`.
-- אותה התנהגות של `Halfspace`, גם כשהנוסחה שלה אינה general plane equation.
-- אותה התנהגות שבה blocker עם `t > EPSILON` מסתיר אור גם אם הוא מעבר ל־light.
-- אותה דוגמת checker שבה `checkSize` ההיסטורי אינו משפיע.
-- אותו `int(channel × 255)`, אותו clamp ל־0…255 ואותו vertical orientation.
-- `float64`, ללא precision נמוך יותר, approximate square root, reassociation או `np.dot`.
+- אותו כלל מתמטי לבחירת נקודת הפגיעה ב־Sphere.
+- אותם ערכי `EPSILON` שמחליטים אם הייתה פגיעה ואם נקודה נמצאת ב־shadow.
+- אותו סדר objects ואותה בחירה באובייקט הראשון כאשר שתי פגיעות שוות.
+- אותו סדר lights ואותו סדר חיבור של reflection, ‏diffuse ו־ambient.
+- אותו עומק reflection ואותה camera geometry.
+- אותה התנהגות של ה־Halfspace ושל דוגמת ה־checkerboard.
+- אותה המרת RGB: כפל ב־255, חיתוך החלק העשרוני והגבלה לטווח 0…255.
+- אותו דיוק מספרי מסוג `float64` ואותו סדר פעולות חשבון.
 
-`OPTIMIZATIONS.md` מתעד בנוסף בדיקות של RGB bytes ו־packed binary64 colours במספר גדלי תמונה, מקרי Sphere גבוליים ואקראיים, thresholds, ties, shadows, checker transitions, reflection levels, helper arithmetic ו־partial batches. עבור ברירת המחדל החדשה 2048, קובץ ה־PPM השמור מספק כאן בדיקת end-to-end ישירה על workload של 800×800.
+`OPTIMIZATIONS.md` מתעד בנוסף בדיקות במספר גדלי תמונה ומקרי קצה של Sphere, ‏shadow, ‏reflection ו־batches חלקיים. עבור ברירת המחדל החדשה 2048, קובץ ה־PPM השמור מספק בדיקה מלאה של התהליך מתחילתו ועד סופו על תמונה של 800×800.
 
 ### 5.3 קישור המדידות לקוד שסופק
 
-לכל run נשמר `source_sha256`. בדקנו שה־hash של כל אחת מחמש גרסאות הקוד שסופקו, לאחר normalization של Windows `CRLF` ל־Linux `LF`, מתאים ל־hash שב־run metadata. לכן אפשר לקשר את Original, ‏V1, ‏V2, ‏V3 ו־V4 לקבצי המקור המתאימים, ולא רק לשמות folders.
+לכל run נשמר `source_sha256`, כלומר טביעת אצבע של קובץ הקוד. לאחר שאיחדנו את סימון סוף השורה של Windows ושל Linux, הטביעות התאימו לכל חמש גרסאות הקוד. לכן ברור איזה קובץ מקור שייך לכל תוצאה.
 
 ### 5.4 גבולות ההבטחה
 
 ההוכחה היא חזקה עבור ה־benchmark וה־Scene שנמדדו, אך אינה טענה שכל API אפשרי נשאר זהה:
 
-- `__slots__` אינו מאפשר arbitrary dynamic attributes באותן מחלקות.
-- inlining עוקף custom subclasses שינסו להחליף helper methods.
-- `radiusSquared` מניח שהרדיוס אינו משתנה לאחר construction.
-- `BatchedRenderer` מכיר את סוגי geometry ו־surface של ה־benchmark, ולא מערכת plugins כללית.
-- inputs לא תקינים, zero-length vectors או `batch size` לא תקין אינם חלק מה־workload.
+- `__slots__` מתאים למחלקות שבהן רשימת השדות ידועה מראש; אי אפשר להוסיף להן שדות חדשים באופן חופשי.
+- כתיבת הנוסחאות ישירות מתאימה למחלקות הקיימות, ולא ל־subclasses שמשנים את התנהגות פונקציות העזר.
+- `radiusSquared` מניח שהרדיוס אינו משתנה לאחר יצירת ה־Sphere.
+- `BatchedRenderer` מכיר את סוגי ה־geometry וה־surface של ה־benchmark, ולא נועד להיות מערכת plugins כללית.
+- קלט לא תקין, Vector באורך אפס או `batch size` לא תקין אינם חלק מה־workload.
 
 הגבולות האלה מקובלים כאן, מפני שהמטרה הייתה לשמר בדיוק את workload המוגדר — לא להרחיב את ה־Raytracer לספרייה כללית.
 
@@ -450,31 +474,31 @@ xychart-beta
 
 השיפור המרכזי לא הגיע מטריק יחיד. הוא הגיע מסדרה של שאלות פשוטות שנשאלו בסדר הנכון.
 
-בהתחלה שאלנו: **איזו עבודה חוזרת ללא צורך?** התשובה הובילה ל־V1: reuse של Shadow Rays ושל camera components, traversal יחיד, פחות temporaries ו־`__slots__`. זה לבדו חתך יותר ממחצית מזמן הריצה.
+בהתחלה שאלנו: **איזו עבודה חוזרת ללא צורך?** התשובה הובילה ל־V1: שימוש חוזר ב־Shadow Rays ובערכי Camera, מעבר אחד על האובייקטים, פחות objects זמניים ו־`__slots__`. זה לבדו חתך יותר ממחצית מזמן הריצה.
 
-לאחר מכן שאלנו: **מדוע פעולה מתמטית קצרה עוברת דרך כל כך הרבה Python machinery?** התשובה הובילה ל־V2 ול־manual inlining של ארבעה helpers חמים.
+לאחר מכן שאלנו: **מדוע פעולה מתמטית קצרה דורשת כל כך הרבה קריאות Python?** התשובה הובילה ל־V2: כתיבת ארבע נוסחאות ישירות במקום שרשרת של פונקציות עזר.
 
 אחר כך שאלנו: **אילו ערכים קבועים בתוך הלולאה?** התשובה הובילה ל־V3 ול־caching של `radiusSquared` ושל camera expressions לכל column.
 
-לבסוף שאלנו: **איך ה־hardware היה רוצה לקבל את העבודה?** Rays הם עצמאיים, ולכן V4 ארגנה אותם ב־SoA batches והעבירה את ה־arithmetic ל־compiled NumPy kernels. בכך היא הפחיתה את מספר ה־instructions בכ־90% ואת זמן הריצה בכ־89%, בלי threads נוספים ובלי שינוי בתמונה.
+לבסוף שאלנו: **איך כדאי למסור את העבודה ל־CPU?** Rays הם עצמאיים, ולכן V4 ארגנה אותם בקבוצות והעבירה את החישובים למערכי NumPy. כך קריאת NumPy אחת מטפלת ב־rays רבים. מספר ה־instructions ירד בכ־90% וזמן הריצה ירד בכ־89%, בלי threads נוספים ובלי שינוי בתמונה.
 
-התוצאה הסופית היא מעבר מ־29.833 ל־3.184 שניות — **9.37× faster** — עם תוצר 800×800 זהה `byte-for-byte`. ה־trade-off הוא שימוש בכ־34.84% יותר Peak RSS ועלייה ב־L1D miss rate, אך מספר ה־L1D misses המוחלט עדיין קטן ב־65.67% משום שסך הגישות קטן מאוד.
+התוצאה הסופית היא מעבר מ־29.833 ל־3.184 שניות — **9.37× faster** — עם תוצר 800×800 זהה `byte-for-byte`. המחיר הוא שימוש בכ־34.84% יותר RAM בשיא. למרות שאחוז ה־L1D cache misses גבוה יותר, מספר ה־misses הכולל עדיין קטן ב־65.67%, משום שה־CPU מבצע הרבה פחות גישות בסך הכול.
 
-זהו Software–Hardware Co-Design במובן המעשי שלו: לא בנינו hardware חדש, אלא שינינו את software כך שיבקש פחות עבודה מה־CPU, יארגן data בצורה ידידותית יותר ל־cache ול־compiled vector kernels, וימדוד את התוצאה בעזרת counters אמיתיים. ה־hardware feedback לא היה קישוט בדוח; הוא הכתיב את הצעד הבא.
+זהו Software–Hardware Co-Design במובן המעשי שלו: לא בנינו hardware חדש, אלא שינינו את software כך שה־CPU יבצע פחות עבודה ויקבל rays רבים יחד בצורה שמתאימה ל־NumPy. אחר כך בדקנו בעזרת hardware counters שה־instructions וה־cycles אכן ירדו. המדידות לא היו רק קישוט בדוח; הן עזרו לבחור את הצעד הבא.
 
-ה־Flame Graph הסופי גם מצביע על המשך טבעי: `Canvas.plot` הוא כעת ה־hotspot המזוהה הגדול. אופטימיזציה עתידית יכולה לבצע RGB conversion וכתיבה ל־Canvas ב־batch, אך היא חייבת לשמור בדיוק על truncation, clamp, orientation ו־PPM bytes. זה יהיה הפרק הבא באותו סיפור: למדוד, לשנות דבר אחד, ולאמת שוב.
+ה־Flame Graph הסופי גם מצביע על המשך טבעי: `Canvas.plot` היא כעת ה־function הבולטת ביותר. אופטימיזציה עתידית יכולה להמיר ולכתוב קבוצה של pixels יחד, אך היא חייבת לשמור בדיוק על אותו עיגול מספרים, אותה הגבלה ל־0…255, אותו סדר שורות ואותם PPM bytes. זה יהיה הפרק הבא באותו סיפור: למדוד, לשנות דבר אחד, ולאמת שוב.
 
 ---
 
 ## Appendix A — מגבלות וקריאה אחראית של המדידות
 
-- קובצי התזמון שסופקו מכילים ערך שמור אחד לכל configuration, ללא variance או confidence interval. לכן אנו מדווחים את התוצאות שנצפו ואיננו טוענים statistical significance.
-- Original והגרסאות המשופרות נמדדו ב־sessions שונים, אך על אותו דגם CPU, אותה תדירות מדווחת, אותו kernel, אותה גרסת CPython ואותו CPU count. השינויים הגדולים ברורים; הבדלים קטנים בין שלבים ראויים לחזרה נוספת אם נדרש אומדן סטטיסטי.
-- Flame Graphs נאספו עם debug Python, בעוד timing ו־hardware counters נאספו עם release Python. לכן האחוזים משמשים למיקום hotspots, לא לחישוב speedup.
-- Hardware events עברו multiplexing של כ־20%–30% מזמן האירוע. counts גדולים מוצגים כפי ש־`perf` דיווח אותם, אך אין להסיק מהם דיוק ברמת cycle בודד.
-- `LLC` events ו־frontend/backend stall events לא היו זמינים. לכן איננו טוענים טענות מדודות על LLC או על סיבת stalls.
-- `perf stat` כולל process startup ו־imports; מדידת `pyperf` היא המקור ל־runtime של ה־benchmark עצמו.
-- חלק מ־run metadata סומן כ־dirty worktree. ה־source hash המדויק עדיין נשמר ותואם לקבצי המקור שסופקו לאחר normalization של line endings, ולכן זהות הקוד הנמדד ניתנת לבדיקה.
+- קובצי התזמון שסופקו מכילים מדידה שמורה אחת לכל configuration, ולא סדרה שממנה אפשר לחשב את פיזור התוצאות. לכן אנו מדווחים בדיוק את מה שנמדד, בלי לטעון מה יהיה הטווח בהרצות נוספות.
+- Original והגרסאות המשופרות נמדדו בזמנים שונים, אך עם אותו דגם CPU, אותה מהירות מדווחת, אותה גרסת Linux, אותה גרסת Python ו־CPU יחיד. השיפורים הגדולים ברורים; אם רוצים להעריך במדויק הבדל קטן, כדאי לחזור על המדידה כמה פעמים.
+- Flame Graphs נאספו עם גרסת Python שמספקת מידע מפורט יותר על קריאות לפונקציות. זמני `pyperf` נאספו עם גרסת Python הרגילה. לכן Flame Graph משמש לאיתור functions איטיות, ולא לחישוב ה־speedup.
+- ה־CPU לא יכול היה למדוד את כל ה־hardware counters בו־זמנית, ולכן `perf` עבר ביניהם והעריך את הסכומים. השינויים הגדולים שימושיים; הבדלים קטנים פחות ודאיים.
+- כמה מדדי cache ועיכובים פנימיים של ה־CPU לא היו זמינים. לכן הדוח אינו מנסה להסביר נתונים שלא נמדדו.
+- `perf stat` כולל גם את פתיחת תהליך Python וטעינת הספריות. זמני `pyperf` הם המקור להשוואת זמן ה־benchmark עצמו.
+- בחלק מהמדידות תיקיית הקוד הכילה גם שינויים שלא נשמרו ב־Git. עם זאת, לכל מדידה נשמר hash של קובץ המקור המדויק, והוא תואם לגרסה שסופקה.
 
 ## Appendix B — קבצי Profiling
 
@@ -500,7 +524,7 @@ xychart-beta
 
 ## Appendix D — גרסאות הקוד שנמדדו
 
-ה־hashes בטבלה הם הערכים שנשמרו ב־run metadata. הם תואמים לקבצים המקומיים לאחר normalization של line endings ל־`LF`.
+ה־hashes בטבלה הם טביעות האצבע שנשמרו בזמן כל מדידה. הם תואמים לקבצים המקומיים לאחר שאיחדנו את סימון סוף השורה של Windows ושל Linux.
 
 | Version | Source file | Recorded source SHA-256 | Snapshot check |
 |---|---|---|---|
