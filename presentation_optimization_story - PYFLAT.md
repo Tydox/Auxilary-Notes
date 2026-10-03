@@ -1,1015 +1,805 @@
-# Raytracer optimization: from profiling to a 9.37x speedup
+# Pyflate optimization: from profiling to a 1.54x speedup
 
-This document explains the complete optimization process in simple English. It
-is structured for presentation use: each improvement has its own explanation,
-expected software and hardware effect, measured evidence, and a short
-before/after code comparison.
+This document explains the Pyflate optimization in simple English. It is
+structured for presentation use: every improvement has its own rationale,
+expected software and hardware effect, measured evidence, and compact
+before/after code.
 
-The optimization kept the raytracer's tested output unchanged. The selected
-800x800 images from Original, V1, V2, V3, V4 with batch 1024, and V4 with batch
-2048 are byte-for-byte identical:
+The optimized decoder produces exactly the same result as the original:
 
 ```text
-SHA-256: 3F8C8BBCA2BD3188BA3AD3B95AE29950C53E1F534983D82A6AF15256AB3D59F0
+Input:          67,562 bytes
+Input SHA-256:  81101162ee7fc7a3db86d1a87e0c86781304eb9026aca4078432004a1383c51a
+Output:         399,360 bytes
+Output MD5:     afa004a630fe072901b1d9628b960974
+Output SHA-256: 86dea2452c818fd8f52536c364eab095e6b0a7bc9fa33b874b10872e401e622f
 ```
-
-The code excerpts are trimmed for readability, but they come from the actual
-saved versions:
 
 | Version | Source of truth |
 |---|---|
-| Original, before V1 | [Original renderer](../suites/original/bm_raytrace/run_benchmark.py) |
-| After V1 / before V2 | [V1 snapshot](../results/raytrace/validation/2026-09-10-helpers/baseline.py) |
-| After V2 / before V3 | [V2 snapshot](../results/raytrace/validation/2026-09-10-radius-camera/baseline.py) |
-| After V3 / before V4 | [V3 snapshot](../results/raytrace/validation/2026-09-10-numpy-batches/baseline.py) |
-| After V4 | [Current optimized renderer](../suites/optimized/bm_raytrace/run_benchmark.py) |
+| Original | [Original Pyflate](../suites/original/bm_pyflate/run_benchmark.py) |
+| Optimized | [Optimized Pyflate](../suites/optimized/bm_pyflate/run_benchmark.py) |
+| Original measurements | [Original result directory](../results/pyflate/original/original%20results%20full%20run) |
+| Optimized measurements | [Latest optimized result directory](../results/pyflate/optimized/2026-09-12-15-16) |
+
+All four optimized result folders contain the same normalized source hash. The
+changes were measured together, so this report does **not** label them V1, V2,
+and so on, and it does not assign the combined performance-counter reduction to
+one edit.
 
 ## 1. What the program does
 
-For each pixel, the raytracer sends a ray from the camera into a scene. It finds
-the closest object hit, calculates the surface normal, checks whether each light
-is visible, adds reflected, diffuse, and ambient colour, and writes the final
-RGB value to the canvas.
+Pyflate is a pure-Python decompressor. The benchmark input is
+`interpreter.tar.bz2`, so the measured path is **BZip2**. The GZip decoder is
+present in the file but is not called by this workload.
+
+In simple terms, the decoder reads a compressed stream a few bits at a time.
+It uses Huffman tables to turn short bit patterns into symbols, reverses the
+move-to-front and run-length transformations, reverses the Burrows-Wheeler
+transform, and rebuilds the original bytes.
 
 ```mermaid
 flowchart TD
-    A[Create scene and canvas] --> B[Create one camera ray per pixel]
-    B --> C[Test the ray against every object]
-    C --> D[Select the closest accepted hit]
-    D --> E[Calculate hit point and surface normal]
-    E --> F[Trace a reflected ray]
-    E --> G[Test shadow rays toward the lights]
-    F --> H[Combine reflected, diffuse and ambient colour]
-    G --> H
-    H --> I[Convert colour to RGB bytes]
+    A[Open the compressed file before timing] --> B[Start timer and seek to the beginning]
+    B --> C[Read magic bytes]
+    C --> D{File type}
+    D -->|BZip2: actual benchmark| E[Read block header and used-symbol map]
+    D -->|GZip: not exercised| Z[GZip decoder]
+    E --> F[Read selectors and build six Huffman tables]
+    F --> G[Choose a Huffman table for each group of 50 symbols]
+    G --> H[Read bits and find the next Huffman symbol]
+    H --> I[Undo run-length and move-to-front coding]
+    I -->|More symbols| G
+    I -->|End of block| J[Reverse the Burrows-Wheeler transform]
+    J --> K[Undo the final run-length coding]
+    K --> L[Return 399,360 output bytes]
+    L --> M[Stop timer]
+    M --> N[Check MD5 after timing]
 ```
 
-The original implementation is small, but each useful arithmetic operation is
-surrounded by Python method calls, object allocation, attribute lookups, loop
-control, and reference counting. That overhead matters because the same work is
-repeated for hundreds of thousands of ray-object tests.
+The timed region includes seeking, bit-reader creation, magic detection, and
+the complete decompression. Opening and closing the file and checking the MD5
+are outside the timer.
 
 ## 2. What profiling showed
 
-The original profile pointed to recursive colour calculation, lighting, shadow
-tests, sphere intersections, temporary vectors, and normalization.
+One decompression performs a large amount of small Python work:
 
-| Original hot path | Approx. inclusive sampled time [s] | What it suggested |
-|---|---:|---|
-| `Scene.rayColour` | 106.88 | Reduce per-ray Python work and temporary hit data. |
-| `SimpleSurface.colourAt` | 80.58 | Reduce repeated lighting and reflection overhead. |
-| `Scene.visibleLights` | 56.10 | Stop rebuilding identical shadow rays. |
-| `Sphere.intersectionTime` | 48.93 | Remove temporary vectors and repeated helper calls. |
-| `Point.__sub__` | 25.87 | Reduce temporary object creation. |
-| `Vector.normalized` | 18.86 | Reduce method calls and repeated normalization. |
+| Work performed once per benchmark decode | Count |
+|---|---:|
+| Input bytes consumed by the bit reservoir | 67,562 |
+| `RBitfield.readbits()` calls | 156,708 |
+| `RBitfield.snoopbits()` calls | 341,601 |
+| Huffman symbols decoded | 148,271 |
+| Original move-to-front helper calls | 92,803 |
+| Selector move-to-front operations | 2,966 |
+| Data-symbol move-to-front operations | 89,837 |
+| Bytes entering inverse BWT | 336,184 |
+| BZip2 blocks | 1 |
+| Huffman tables | 6 |
 
-These are inclusive call-path times, so they overlap and must not be added
-together.
+The original profile showed that Huffman lookup, bit reading, move-to-front
+updates, and BWT reconstruction dominated the useful Python work.
+
+The following values are rough estimates formed by scaling exclusive sample
+shares from debug-Python profiles by separate regular-Python benchmark means.
+Treat them as directional. The inclusive call paths shown below can overlap and must not be added together.
+
+| Function | Original approx. self time [ms] | Optimized approx. self time [ms] | What it means |
+|---|---:|---:|---|
+| `decode_huffman_block` | 175.3 | 128.3 | The complete symbol-decoding loop performs less Python work even though some helper work was moved into it. |
+| `HuffmanTable.find_next_symbol` | 80.2 | 65.6 | Absolute lookup time fell by about 18%; its percentage grew because other code became faster. |
+| `move_to_front` | 101.5 | 0.3 | The hot data update was inlined. Its work did not all disappear; most moved into the caller. |
+| `RBitfield.readbits` | 52.3 | 32.0 | Direct masking and simpler state updates reduced bit-reader overhead. |
+| `RBitfield.snoopbits` | 50.1 | 44.9 | The same bit inspection remains necessary, but helper-call overhead fell. |
+| `BitfieldBase._mask` | 38.0 | no separate frame | The mask expression was placed directly in the caller. |
+| `bwt_transform` | 65.6 | 70.4 | The new counting algorithm did not show a profile improvement for this input. |
+| `bwt_reverse` | 48.1 | 48.5 | Preallocation did not produce a clear measured gain. |
+
+Inclusive profile samples provide the same overall direction:
+
+| Inclusive call path | Original samples | Optimized samples | Change |
+|---|---:|---:|---:|
+| `HuffmanTable.find_next_symbol` | 14,713 | 10,197 | -30.69% |
+| `RBitfield.readbits` | 4,042 | 1,878 | -53.54% |
+| `move_to_front` | 5,824 | 18 | -99.69% as a separate function |
+
+The `move_to_front` row reflects inlining as well as optimization. It must not
+be read as "99.69% of all move-to-front work disappeared."
 
 ## 3. Optimization reasoning
 
-The work progressed from low-risk Python changes to a larger data-parallel
-rewrite:
+The goal was to keep the decompression algorithm and output unchanged while
+removing Python bookkeeping around it.
 
 ```mermaid
 flowchart LR
-    A[Profile Original] --> B[V1: remove repeated Python work]
-    B --> C[V2: write hot arithmetic directly]
-    C --> D[V3: cache values that do not change]
-    D --> E[V4: process many rays with NumPy]
-    E --> F[Tune batch size: 1024 to 2048]
+    A[Profile Original] --> B[Reduce bit-reader calls and temporary work]
+    B --> C[Replace linear Huffman entry scans with dictionary lookup]
+    C --> D[Reduce move-to-front slicing and function calls]
+    D --> E[Keep byte values as integers in contiguous bytearrays]
+    E --> F[Try lower-complexity BWT construction and preallocation]
+    F --> G[Measure exact output, time, instructions and memory behavior]
 ```
 
-The main question at every stage was: **can we do the same calculation with
-less interpreter work, fewer temporary objects, or more work per compiled
-operation?**
+The main reasoning was:
 
-## 4. Measurement summary
+1. Optimize operations repeated hundreds of thousands of times first.
+2. Store bytes as byte values instead of thousands of one-byte Python objects.
+3. Trade a small amount of setup work for cheaper work inside the hot loop.
+4. Check the profile after optimization, including changes that did not clearly
+   improve.
+5. Use exact output bytes as the correctness requirement.
 
-All rows use the same 800x800 workload, one CPU, and CPython 3.12.13 on the
-assignment server. V1 through V4 were measured during the same server boot. The
-Original run used the same configuration but came from an earlier boot.
+### 3.1 Complete change summary
 
-The benchmark time below comes from the saved timing result. Hardware counters
-come from a separate `perf stat` execution of the same workload.
+The table below gives the complete presentation-level map. The detailed
+sections that follow contain the before/after code.
 
-| Version | Benchmark time [ms] | Speedup vs previous | Speedup vs Original | Instructions [B] | Cycles [B] | Branch misses [M] |
-|---|---:|---:|---:|---:|---:|---:|
-| Original | 29,832.6 | 1.00x | 1.00x | 186.72 | 71.65 | 173.48 |
-| V1: remove repeated Python work | 13,636.5 | 2.19x | 2.19x | 82.98 | 33.03 | 79.91 |
-| V2: direct helper arithmetic | 12,734.2 | 1.07x | 2.34x | 77.80 | 30.33 | 68.10 |
-| V3: cache radius and camera values | 12,075.5 | 1.05x | 2.47x | 74.43 | 29.44 | 66.87 |
-| V4: NumPy, batch 1024 | 3,862.3 | 3.13x | 7.72x | 21.01 | 9.71 | 24.25 |
-| V4: NumPy, batch 2048 | 3,183.6 | 1.21x | **9.37x** | 18.34 | 8.15 | 18.21 |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
+|---|---|---|---|
+| Direct BZip2 byte access | Use the integer already returned by byte indexing and combine the reservoir update. | Fewer Python calls and attribute writes around the same scalar shift/add. | Runs 67,562 times; approximate refill self time fell from 14.7 to 12.5 ms. |
+| Inline bit masks | Calculate masks in the reader and keep the remaining low bits directly. | Fewer call frames, lookups, shifts, inversions, branches, and temporary integers. | The mask frame disappears; read self time fell about 38.8%. |
+| Dictionary-based Huffman lookup | Precompute a mapping from code length and visible bits to decoded symbol. | Fewer table-object loads, comparisons, loop iterations, and branches; small setup-memory cost. | 883,623 linear comparisons became 341,601 dictionary probes; inclusive lookup samples fell 30.69%. |
+| Simpler bit reversal | Build the reversed result one bit at a time. | Simpler state, but still scalar setup work. | Only 882 calls; no isolated speedup is claimed. |
+| In-place move-to-front | Replace list slicing and concatenation with pop and insert. | Fewer temporary lists, copied references, allocations, loads, and stores. | Part of the combined MTF improvement; not timed alone. |
+| Inline hot move-to-front | Update the favourites list inside the decode loop. | Removes tens of thousands of Python function calls. | Helper calls fell from 92,803 to 2,966; some work moved into the caller. |
+| Direct metadata appends | Use append and extend instead of one-element temporary lists. | Less allocation and reference copying during block setup. | Small setup contribution; not timed alone. |
+| Histogram BWT construction | Count byte values instead of sorting and repeatedly searching. | Better algorithmic complexity, but more work executes in the Python interpreter. | Approximate BWT-transform self time rose from 65.6 to 70.4 ms; benefit is unconfirmed. |
+| Preallocated inverse-BWT output | Fill an exact-size bytearray instead of growing a Python list. | Denser storage and less dynamic list growth. | Reverse time stayed near 48 ms; no clear individual gain. |
+| Integer symbols and block bytearray | Keep byte values as integers in one contiguous buffer. | Fewer list entries, references, intermediate chunks, copies, and cache lines. | The combined 39.04% RSS and 67.59% L1-miss reductions are consistent with this representation change. |
+| Contiguous final output | Append or extend one bytearray and convert once at the end. | Removes 302,016 list entries, pointer chasing, and a large final join. | The combined cache, page-fault, and memory reductions are consistent with this change. |
+| GZip buffer cleanup | Apply similar bytearray changes to the GZip decoder. | Expected to reduce GZip object overhead. | Not executed by the BZip2 benchmark, so it explains none of the measured result. |
 
-The relationship is strong: the faster versions execute far fewer instructions
-and cycles. The final version is 9.37x faster, with 90.18% fewer instructions,
-88.62% fewer cycles, and 89.50% fewer branch misses than Original.
+## 4. Overall measured result
 
-| Version | Cache references [M] | Cache misses [K] | L1 data-load misses [M] | dTLB load misses [M] | Peak memory [MiB] |
-|---|---:|---:|---:|---:|---:|
-| Original | 45.85 | 189.90 | 585.92 | 6.93 | 36.27 |
-| V1 | 41.04 | 176.03 | 410.78 | 3.33 | 36.39 |
-| V2 | 25.31 | 171.00 | 326.12 | 2.93 | 36.43 |
-| V3 | 35.21 | 184.65 | 376.70 | 2.79 | 36.48 |
-| V4, batch 1024 | 97.97 | 681.76 | 213.00 | 1.74 | 48.97 |
-| V4, batch 2048 | 78.68 | 671.85 | 201.15 | 1.45 | 48.91 |
+The main comparison uses 60-value regular-Python runs from the same server boot,
+on one CPU, with CPython 3.12.13 and the same 67,562-byte input.
 
-The NumPy implementation uses about 34% more peak memory because it creates
-arrays for a batch of rays. Its cache-miss percentage is also higher. However,
-it executes so much less total work that the absolute number of L1 data loads,
-L1 misses, instructions, and cycles still falls strongly.
-
-## 5. V1 — remove repeated Python work
-
-V1 kept the scalar, one-ray-at-a-time design. It removed repeated work and
-temporary Python objects from the hottest paths.
-
-| Original to V1 | Before | After | Change |
+| Measurement | Original | Optimized | Change |
 |---|---:|---:|---:|
-| Benchmark time [ms] | 29,832.6 | 13,636.5 | **-54.29%** |
-| Instructions [B] | 186.72 | 82.98 | **-55.56%** |
-| Cycles [B] | 71.65 | 33.03 | **-53.90%** |
-| Branch instructions [B] | 30.40 | 13.71 | **-54.90%** |
-| Branch misses [M] | 173.48 | 79.91 | **-53.94%** |
-| L1 data loads [B] | 42.99 | 19.11 | **-55.55%** |
-| L1 data stores [B] | 10.20 | 4.57 | **-55.26%** |
+| Arithmetic mean | 662.237 ms | 430.018 ms | **-35.07%** |
+| Median | 659.092 ms | 428.317 ms | -35.01% |
+| Minimum | 652.654 ms | 425.536 ms | -34.80% |
+| Maximum | 736.233 ms | 518.911 ms | -29.52% |
+| Sample standard deviation | 11.667 ms | 11.810 ms | similar absolute variation |
+| Maximum recorded RSS | 61.90 MiB | 37.73 MiB | **-39.04%** |
+| Speedup | 1.00x | **1.540x** | 54.0% more work completed per unit time |
 
-Separate instrumentation of one 100x100 render explains the reduction:
+The latest run uses the current optimized source. A same-commit optimized run
+measured 431.718 ms. It is only 0.39% slower than the latest 430.018 ms result,
+which supports repeatability.
 
-| Operation | Original | V1 | Change |
+### 4.1 Supporting `perf stat` evidence
+
+The counters below cover a complete pyperf invocation, including startup and
+warmups. They are not the counters for one 662 ms or 430 ms decode, so timing
+comes from `timing.json` and counters are supporting evidence.
+
+| Counter over full pyperf invocation | Original | Optimized | Change |
 |---|---:|---:|---:|
-| `Vector` constructions | 452,943 | 85,013 | -81.2% |
-| `Ray` constructions | 98,172 | 26,000 | -73.5% |
-| Vector normalizations | 109,887 | 27,479 | -75.0% |
-| Sphere intersection tests | 179,457 | 179,457 | unchanged |
-| Halfspace intersection tests | 25,501 | 25,501 | unchanged |
+| Elapsed time | 63.715 s | 43.253 s | -32.11% |
+| CPU clock | 63.204 s | 42.925 s | -32.08% |
+| Instructions | 382.299 B | 248.717 B | **-34.94%** |
+| CPU cycles | 143.192 B | 96.466 B | **-32.63%** |
+| Branch instructions | 63.898 B | 36.850 B | **-42.33%** |
+| Branch misses | 331.517 M | 189.527 M | **-42.83%** |
+| Cache references | 451.591 M | 315.042 M | -30.24% |
+| Cache misses | 38.158 M | 10.704 M | **-71.95%** |
+| L1 data loads | 83.038 B | 54.141 B | -34.80% |
+| L1 data-load misses | 1.754 B | 0.568 B | **-67.59%** |
+| L1 data stores | 16.184 B | 11.173 B | -30.96% |
+| Minor page faults | 695,238 | 394,683 | -43.23% |
 
-The same geometry was tested. The program simply spent less Python work around
-each test.
+| Derived rate | Original | Optimized | Interpretation |
+|---|---:|---:|---|
+| Instructions per cycle | 2.670 | 2.578 | Slightly lower; speed came from doing less work, not from making each instruction run faster. |
+| Branch-miss rate | 0.519% | 0.514% | Nearly unchanged; fewer total branches explain the lower miss count. |
+| Cache-miss rate | 8.45% | 3.40% | Consistent with a smaller, denser working set; identical-source reruns show that the exact count varies. |
+| L1 data-load miss rate | 2.11% | 1.05% | Consistent with more useful data staying local to the core. |
+| CPU utilization | about 0.992 CPU | about 0.992 CPU | Both versions remain single-core workloads. |
 
-### 5.1 Reuse one shadow ray
+The close match between the **35.07% time reduction** and the **34.94%
+instruction reduction** is the clearest cause-and-effect result. The program
+became faster mainly because it asked the Python interpreter to execute less
+work. Hardware events were multiplexed at roughly 20-31% coverage, so the large
+trends are useful but small differences should not be overinterpreted. Cache-miss counts also varied across repeated runs of the same optimized source, so their direction supports the memory explanation but the exact percentage is not a per-edit result.
 
-**Problem:** The original code rebuilt and normalized the same shadow ray once
-for every object tested against a light.
+## 5. Improvement 1: read each compressed byte more directly
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+**Problem:** The hot BZip2 bit reader converted a one-byte `bytes` object with
+`ord()` and updated the reservoir in two statements.
+
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Create one shadow ray per point/light pair and reuse it for all objects. | Every object receives the same origin and direction, so rebuilding the ray cannot change the answer. | Fewer `Ray` and `Vector` objects, method calls, square roots, divisions, instructions, loads, and stores. | The isolated local stage improved by about 22.7% in both passes. It is part of V1's 54.29% time and 55.56% instruction reduction. |
+| Read the integer byte with `c[0]` and combine shift and add. | In Python 3, indexing a `bytes` object already returns an integer, so `ord()` is unnecessary. | Removes a Python function call and one attribute update per input byte. The CPU still performs the same scalar shift and add, with less interpreter work around them. | This path runs 67,562 times. Approximate `_more` self time fell from 14.7 ms to 12.5 ms, but this edit was not measured alone. |
 
 **Before**
 
 ```python
-def _lightIsVisible(self, l, p):
-    for (o, s) in self.objects:
-        t = o.intersectionTime(Ray(p, l - p))
-        if t is not None and t > EPSILON:
-            return False
-    return True
+def _more(self):
+    c = self._read(1)
+    self.bitfield <<= 8
+    self.bitfield += ord(c)
+    self.bits += 8
 ```
 
 **After**
 
 ```python
-def _lightIsVisible(self, l, p):
-    return self._lightRayIsVisible(Ray(p, l - p))
-
-def _lightRayIsVisible(self, ray):
-    for (o, s) in self.objects:
-        t = o.intersectionTime(ray)
-        if t is not None and t > EPSILON:
-            return False
-    return True
+def _more(self):
+    c = self._read(1)
+    self.bitfield = (self.bitfield << 8) + c[0]
+    self.bits += 8
 ```
 
-**Presentation takeaway:** We moved identical work out of the inner object loop.
+**Simple explanation:** The byte is already a number. The optimized code uses
+that number directly instead of asking Python to convert it again.
 
-### 5.2 Cache camera row and column components
+## 6. Improvement 2: calculate bit masks inside the hot reader
 
-**Problem:** The camera recalculated the same horizontal value for every row and
-the same vertical value for every column.
+**Problem:** Every bit read called a tiny `_mask()` method. `readbits()` also
+built a mask, shifted it, inverted it, and then used it to retain the unread
+bits.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Calculate horizontal components once per column and the vertical component once per row. | Those values depend on only one coordinate, so most pixel-loop calculations were duplicates. | At 100x100, component scaling falls from roughly 20,000 calls to 200. This reduces Python calls, multiplications, allocations, loads, and stores. | The isolated local result was small and noisy, so no individual speedup is claimed. It contributes to the combined V1 result. |
+| Inline `(1 << n) - 1` and retain the remaining low bits directly. | The helper contains one expression, and after reducing `self.bits` the required retained mask is simply `(1 << self.bits) - 1`. | Fewer Python call frames, lookups, shifts, inversions, branches, and temporary integers in a very hot path. | One decode calls `readbits` 156,708 times and `snoopbits` 341,601 times. `_mask` disappears as a sampled frame; `readbits` self time fell about 38.8%. |
 
 **Before**
 
 ```python
-for y in range(canvas.height):
-    for x in range(canvas.width):
-        xcomp = vpRight.scale(x * pixelWidth - halfWidth)
-        ycomp = vpUp.scale(y * pixelHeight - halfHeight)
-        ray = Ray(eye.point, eye.vector + xcomp + ycomp)
+def snoopbits(self, n=8):
+    if n > self.bits:
+        self.needbits(n)
+    return (self.bitfield >> (self.bits - n)) & self._mask(n)
+
+def readbits(self, n=8):
+    if n > self.bits:
+        self.needbits(n)
+    r = (self.bitfield >> (self.bits - n)) & self._mask(n)
+    self.bits -= n
+    self.bitfield &= ~(self._mask(n) << self.bits)
+    return r
 ```
 
 **After**
 
 ```python
-xcomponents = [vpRight.scale(x * pixelWidth - halfWidth) for x in range(canvas.width)]
-for y in range(canvas.height):
-    ycomp = vpUp.scale(y * pixelHeight - halfHeight)
-    for x, xcomp in enumerate(xcomponents):
-        ray = Ray(eye.point, eye.vector + xcomp + ycomp)
+def snoopbits(self, n=8):
+    if n > self.bits:
+        self.needbits(n)
+    return (self.bitfield >> (self.bits - n)) & ((1 << n) - 1)
+
+def readbits(self, n=8):
+    if n > self.bits:
+        self.needbits(n)
+    r = (self.bitfield >> (self.bits - n)) & ((1 << n) - 1)
+    self.bits -= n
+    self.bitfield &= (1 << self.bits) - 1
+    return r
 ```
 
-**Presentation takeaway:** A column value is calculated once for the column, and
-a row value is calculated once for the row.
+**Simple explanation:** Instead of calling another Python function to make a
+small stencil for the bits, the reader makes the stencil where it is used.
 
-### 5.3 Select the closest hit during traversal
+## 7. Improvement 3: use dictionaries for Huffman lookup
 
-**Problem:** The original code created a list of eight result tuples and then
-scanned that list a second time.
+**Problem:** To decode one symbol, the original code walked through Huffman
+table objects one by one. It reused the visible bit pattern for entries of the
+same length, but still compared that pattern against every entry.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+A Python dictionary is a key-value lookup table. Here the key is
+`(code length, visible bits)` and the value is the decoded symbol.
+
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Keep the nearest accepted hit while testing objects. | The current best hit is all later code needs. The strict comparison keeps the original tie behavior. | Removes the temporary list, result tuples, second loop, allocations, reference counting, and memory traffic. | The cumulative local step was about 3% faster. It contributes to V1's large instruction, cycle, and branch reduction. |
+| Build normal and reversed lookup dictionaries once, record the distinct code lengths, and probe one dictionary entry per length. | The tables are reused for thousands of symbols, so a small setup cost avoids repeated linear scans. | Fewer object loads, comparisons, loop iterations, and conditional branches. It uses a little more table memory. A hardware equivalent can compare many entries in parallel. | For 148,271 decodes, 883,623 linear entry comparisons became 341,601 dictionary probes, a 61.34% reduction in lookup attempts. Inclusive lookup samples fell 30.69%. |
 
 **Before**
 
 ```python
-intersections = [(o, o.intersectionTime(ray), s) for (o, s) in self.objects]
-i = firstIntersection(intersections)
+def find_next_symbol(self, field, reversed=True):
+    cached_length = -1
+    cached = None
+    for x in self.table:
+        if cached_length != x.bits:
+            cached = field.snoopbits(x.bits)
+            cached_length = x.bits
+        if (reversed and x.reverse_symbol == cached) or (not reversed and x.symbol == cached):
+            field.readbits(x.bits)
+            return x.code
 ```
 
 **After**
 
 ```python
-closestTime = None
-for o, s in self.objects:
-    t = o.intersectionTime(ray)
-    if t is not None and t > -EPSILON:
-        if closestTime is None or t < closestTime:
-            closestObject = o
-            closestTime = t
-            closestSurface = s
+def populate_huffman_symbols(self):
+    # Existing symbol construction remains above these lines.
+    self.lookup_normal = {(x.bits, x.symbol): x.code for x in self.table}
+    self.lookup_reversed = {(x.bits, x.reverse_symbol): x.code for x in self.table}
+    self.unique_lengths = sorted(list(set(x.bits for x in self.table if x.bits > 0)))
+
+def find_next_symbol(self, field, reversed_code=True):
+    lookup = self.lookup_reversed if reversed_code else self.lookup_normal
+    for length in self.unique_lengths:
+        cached = field.snoopbits(length)
+        code = lookup.get((length, cached))
+        if code is not None:
+            field.readbits(length)
+            return code
 ```
 
-**Presentation takeaway:** We kept only the best answer instead of building a
-temporary collection of every answer.
+**Simple explanation:** The original searched many cards in a pile. The
+optimized version labels drawers by code length and visible bits, then opens the
+matching drawer.
 
-### 5.4 Calculate sphere intersections with scalar locals
+The lookup occupies a larger **percentage** of the optimized profile because
+other functions became faster. Its absolute sample count and estimated time
+both fell.
 
-**Problem:** Each sphere test created a temporary `Vector` and called general
-`dot` methods for a fixed three-coordinate calculation.
+## 8. Improvement 4: simplify bit reversal during table setup
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+**Problem:** The original bit reversal maintained masks at both ends and moved
+two bits per loop. The replacement builds the reversed result one bit at a
+time.
+
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Read coordinates into local variables and write the same arithmetic directly. | The sphere formula always uses exactly three coordinates, so general Python objects and dispatch add overhead without changing the math. | Removes temporary objects, attribute lookups, method calls, and reference management. The CPU sees fewer interpreter instructions around the same floating-point work. | This was the strongest isolated V1 step: about 32–34% faster locally. The number of sphere tests stayed unchanged. |
+| Shift the result left and append the next low input bit. | The direct loop is easier to follow and uses fewer live variables and mask updates. | Simpler scalar operations and less temporary state. It is table-setup work, so the whole-program effect is expected to be small. | Called only 882 times per decode, compared with 148,271 symbol lookups. No isolated speedup is claimed. |
 
 **Before**
 
 ```python
-cp = self.centre - ray.point
-v = cp.dot(ray.vector)
-discriminant = (self.radius * self.radius) - (cp.dot(cp) - v * v)
+def reverse_bits(v, n):
+    a = 1 << 0
+    b = 1 << (n - 1)
+    z = 0
+    for i in range(n - 1, -1, -2):
+        z |= (v >> i) & a
+        z |= (v << i) & b
+        a <<= 1
+        b >>= 1
+    return z
 ```
 
 **After**
 
 ```python
-centre = self.centre
-point = ray.point
-direction = ray.vector
-cpx = centre.x - point.x
-cpy = centre.y - point.y
-cpz = centre.z - point.z
-v = ((cpx * direction.x) + (cpy * direction.y) + (cpz * direction.z))
-cpSquared = ((cpx * cpx) + (cpy * cpy) + (cpz * cpz))
-discriminant = (self.radius * self.radius) - (cpSquared - v * v)
+def reverse_bits(v, n):
+    z = 0
+    for _ in range(n):
+        z = (z << 1) | (v & 1)
+        v >>= 1
+    return z
 ```
 
-**Presentation takeaway:** We preserved the formula and removed the Python object
-machinery around it.
+**Simple explanation:** Read one bit, place it at the other end, and repeat.
+Because this happens during setup rather than for every output byte, it is a
+secondary optimization.
 
-### 5.5 Add `__slots__`
+## 9. Improvement 5: update move-to-front lists without rebuilding them
 
-**Problem:** By default, every `Vector`, `Point`, and `Ray` instance carries a
-dictionary that maps attribute names to values.
+**Problem:** The original helper created three list slices, combined them into
+another list, and copied that list back into the original.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Declare the exact fields allowed in small geometry classes. | `__slots__` tells Python that the object needs only fixed fields, so it does not create a separate attribute dictionary for every instance. | Smaller objects, less allocation metadata, and potentially better CPU-cache locality. Coordinates are still Python objects; this is not packed numeric storage. | Isolated timing was inconsistent, so no individual speedup is claimed. It is part of the combined V1 result. |
+| Remove the selected item with `pop()` and insert it at the front. | The list can be changed in place without creating several temporary lists. | Fewer allocations, copied references, loads, stores, and garbage for each update. | The original called this helper 92,803 times. The optimized helper remains for 2,966 selector updates; the hotter 89,837 data updates are inlined in the next improvement. |
 
 **Before**
 
 ```python
-class Vector(object):
-    def __init__(self, initx, inity, initz):
-        self.x = initx
-        self.y = inity
-        self.z = initz
+def move_to_front(l, c):
+    l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
 ```
 
 **After**
 
 ```python
-class Vector(object):
-    __slots__ = ('x', 'y', 'z')
-
-    def __init__(self, initx, inity, initz):
-        self.x = initx
-        self.y = inity
-        self.z = initz
-
-class Point(object):
-    __slots__ = ('x', 'y', 'z')
-
-class Ray(object):
-    __slots__ = ('point', 'vector')
+def move_to_front(lst, c):
+    val = lst.pop(c)
+    lst.insert(0, val)
 ```
 
-**Presentation takeaway:** Each temporary geometry object became a smaller,
-simpler Python object.
+**Simple explanation:** Instead of photocopying most of the list to move one
+item, take that item out and put it at the front.
 
-### 5.6 Reuse the normalized shadow direction for diffuse lighting
+## 10. Improvement 6: inline the hot move-to-front update
 
-**Problem:** After normalizing a shadow ray to test visibility, the original
-lighting code subtracted the same points and normalized the same direction
-again.
+**Problem:** The data-symbol loop called `move_to_front()` for nearly every
+decoded non-run symbol. A Python function call was added to an operation that
+needed only a few list actions.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Yield the already normalized shadow-ray direction to the lighting calculation. | The visibility ray and Lambert lighting use the same point-to-light direction. | Removes another subtraction, normalization, square root, division, temporary vector, and visible-light list entry for each visible light. | The cumulative local step improved by roughly 5%. It contributes to V1's reduction in ray construction, normalization, instructions, and cycles. |
+| Perform `pop()` and `insert()` directly in the decode loop. | The loop already needs the selected value for output, so it can fetch and move it in one place. | Removes tens of thousands of Python function calls and avoids repeated slicing allocations. The MTF state remains sequential because each symbol changes the next lookup order. | Helper calls fell from 92,803 to 2,966. The separate `move_to_front` inclusive profile samples fell 99.69%, while some work moved into `decode_huffman_block`. |
 
 **Before**
 
 ```python
-for lightPoint in scene.visibleLights(p):
-    contribution = (lightPoint - p).normalized().dot(normal)
+o = favourites[r - 1]
+move_to_front(favourites, r - 1)
+buffer.append(o)
 ```
 
 **After**
 
 ```python
-def _visibleLightDirections(self, p):
-    for light in self.lightPoints:
-        ray = Ray(p, light - p)
-        if self._lightRayIsVisible(ray):
-            yield ray.vector
-
-for lightDirection in scene._visibleLightDirections(p):
-    contribution = lightDirection.dot(normal)
+val = favourites.pop(r - 1)
+favourites.insert(0, val)
+buffer.append(val)
 ```
 
-**Presentation takeaway:** The direction calculated for the shadow test is reused
-for lighting.
+**Simple explanation:** The hot loop stopped asking another function to move
+the item. It moves the item itself and immediately saves the value.
 
-### 5.7 Remove discarded checkerboard scaling
+## 11. Improvement 7: avoid one-element temporary lists during setup
 
-**Problem:** `v.scale(...)` returned a new vector, but the code discarded that
-return value. The next lines still read the original `v`.
+**Problem:** Expressions such as `lengths += [length]` create a new one-element
+list just to add one item. The original used this pattern while reading symbol
+maps and code lengths.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Remove the call whose result was unused. | It could not affect the checker pattern because `Vector.scale` does not modify `v` in place. | Saves one vector allocation, three multiplications, a call, and reference-management work for each checker lookup. | The isolated timing was inconclusive because this is a small part of the full render. It contributes to the combined V1 work reduction. |
+| Use `append()` for one item and `extend()` for a known group. | These methods express the intended list update directly and avoid temporary one-element lists. | Fewer allocations, reference copies, and interpreter operations. | This runs during one-block setup, so it is a small contributor. It was not measured separately. |
 
 **Before**
 
 ```python
-v = p - Point.ZERO
-v.scale(1.0 / self.checkSize)
-if ((int(abs(v.x) + 0.5) + int(abs(v.y) + 0.5) + int(abs(v.z) + 0.5)) % 2):
+used += [bool(huffman_used_bitmap & bit_mask)]
+lengths += [length]
+groups_lengths += [lengths]
 ```
 
 **After**
 
 ```python
-v = p - Point.ZERO
-if ((int(abs(v.x) + 0.5) + int(abs(v.y) + 0.5) + int(abs(v.z) + 0.5)) % 2):
+used.append(bool(bitmap & (1 << j)))
+lengths.append(length)
+groups_lengths.append(lengths)
 ```
 
-**Presentation takeaway:** We deleted work that produced a value nobody used.
+**Simple explanation:** To add one item to a shopping list, add the item
+directly instead of first making a second one-item shopping list.
 
-## 6. V2 — write four hot helper calculations directly
+## 12. Improvement 8: build the BWT table with a histogram
 
-V2 applied the same idea as scalar sphere intersections to four frequently
-called helpers. The mathematical order was preserved, but intermediate method
-calls and objects were removed.
+**Problem:** The original sorted every byte and then searched the sorted byte
+string 256 times to find where each byte value begins.
 
-| V1 to V2 | Before | After | Change |
-|---|---:|---:|---:|
-| Benchmark time [ms] | 13,636.5 | 12,734.2 | **-6.62%** |
-| Instructions [B] | 82.98 | 77.80 | **-6.25%** |
-| Cycles [B] | 33.03 | 30.33 | **-8.19%** |
-| Branch instructions [B] | 13.71 | 12.95 | **-5.54%** |
-| Branch misses [M] | 79.91 | 68.10 | **-14.78%** |
-| L1 data-load misses [M] | 410.78 | 326.12 | **-20.61%** |
-
-Separate 100x100 instrumentation shows what changed:
-
-| Operation | V1 | V2 | Change |
-|---|---:|---:|---:|
-| `Vector` constructions | 85,013 | 67,538 | -20.6% |
-| `Vector.magnitude` calls | 27,479 | 0 | -100% |
-| `Vector.dot` calls | 68,549 | 41,070 | -40.1% |
-| `Vector.scale` calls | 43,678 | 200 | -99.5% |
-| Sphere intersection tests | 179,457 | 179,457 | unchanged |
-| Halfspace intersection tests | 25,501 | 25,501 | unchanged |
-
-Zero `magnitude` calls does not mean zero square roots. The square-root
-calculation was moved directly into the optimized helpers.
-
-### 6.1 Direct `Vector.normalized()` arithmetic
-
-**Problem:** One normalization called `magnitude`, which called `dot`, and then
-called `scale`. Each small helper added a Python call frame and lookups.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Calculate squared length, square root, reciprocal, and coordinates in one method. | The exact operation is known, so the call chain can be replaced by the same arithmetic. | Fewer Python calls and lookups; no temporary result from `scale` beyond the final vector. The same square root and floating-point math remain. | Individual desktop timing was not repeatably significant. All four V2 changes together reduced server time 6.62%, instructions 6.25%, and cycles 8.19%. |
+| Count each byte value, convert counts to starting positions, and fill the pointer table. | Counting is O(n + 256), while sorting is O(n log n) plus repeated searches. | The algorithm performs less abstract work and uses a fixed 257-counter table. In Python, however, the counting loop runs in the interpreter while `sorted()` and `bytes.find()` use fast native code. | `bwt_transform` approximate self time changed from 65.6 ms to 70.4 ms. This profile does **not** confirm an improvement for the fixed input. |
 
 **Before**
 
 ```python
-def normalized(self):
-    return self.scale(1.0 / self.magnitude())
+def bwt_transform(L):
+    F = bytes(sorted(L))
+    base = []
+    for i in range(256):
+        base.append(F.find(int2byte(i)))
+    pointers = [-1] * len(L)
+    for i, symbol in enumerate(L):
+        pointers[base[symbol]] = i
+        base[symbol] += 1
+    return pointers
 ```
 
 **After**
 
 ```python
-def normalized(self):
-    x = self.x
-    y = self.y
-    z = self.z
-    factor = 1.0 / math.sqrt((x * x) + (y * y) + (z * z))
-    return Vector(factor * x, factor * y, factor * z)
+def bwt_transform(l_seq):
+    counts = [0] * 257
+    for byte_val in l_seq:
+        counts[byte_val + 1] += 1
+    for i in range(1, 256):
+        counts[i] += counts[i - 1]
+    base = counts[:256]
+    pointers = [-1] * len(l_seq)
+    for i, symbol in enumerate(l_seq):
+        pointers[base[symbol]] = i
+        base[symbol] += 1
+    return pointers
 ```
 
-**Presentation takeaway:** The CPU performs the same math through one Python
-method instead of a chain of methods.
+**Simple explanation:** The new algorithm counts how many zeros, ones, twos,
+and so on exist, instead of sorting the whole collection.
 
-### 6.2 Direct `Vector.reflectThrough()` arithmetic
+This is also an important negative result: a better big-O algorithm can be
+slower in pure Python when it replaces optimized C library work with a long
+Python loop. It should be tested independently before being credited as a
+speedup.
 
-**Problem:** Reflection constructed two intermediate vectors and then a third
-vector for the result.
+## 13. Improvement 9: preallocate inverse-BWT output
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+**Problem:** The original inverse BWT appended Python integers to a growing
+list and converted the list to `bytes` at the end.
+
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Keep the dot product, then calculate the three result coordinates directly. | Only the final reflected vector is needed. | Vector constructions fall from three to one per reflection, reducing allocation, method dispatch, loads, stores, and reference counting. | No reliable isolated speedup was measured. Its effect is included in V2's stage-wide reductions. |
+| Allocate the exact-size `bytearray` first and write each byte by index. | The output size is already known. A bytearray stores compact byte values instead of pointers to Python objects. | Less dynamic growth and denser memory, with potentially better cache locality. The pointer-following BWT dependency remains unchanged. | Approximate `bwt_reverse` self time stayed near 48 ms. No clear individual benefit was measured. |
 
 **Before**
 
 ```python
-def reflectThrough(self, normal):
-    d = normal.scale(self.dot(normal))
-    return self - d.scale(2)
+def bwt_reverse(L, end):
+    out = []
+    if len(L):
+        T = bwt_transform(L)
+        for i in range(len(L)):
+            end = T[end]
+            out.append(L[end])
+    return bytes(out)
 ```
 
 **After**
 
 ```python
-def reflectThrough(self, normal):
-    projection = self.dot(normal)
-    return Vector(self.x - 2 * (projection * normal.x), self.y - 2 * (projection * normal.y), self.z - 2 * (projection * normal.z))
+def bwt_reverse(l_seq, end):
+    if not l_seq:
+        return b""
+    t_table = bwt_transform(l_seq)
+    out = bytearray(len(l_seq))
+    curr = end
+    for i in range(len(l_seq)):
+        curr = t_table[curr]
+        out[i] = l_seq[curr]
+    return bytes(out)
 ```
 
-**Presentation takeaway:** Reflection now creates only the vector that the caller
-actually needs.
+**Simple explanation:** The decoder knows the box size in advance, so it makes
+one correctly sized byte box instead of growing a list one entry at a time.
 
-### 6.3 Direct `Ray.pointAtTime()` arithmetic
+## 14. Improvement 10: keep decoded symbols as integers in a bytearray
 
-**Problem:** Calculating a hit point first created a scaled direction vector and
-then created the final point.
+**Problem:** The original favourites list stored one-byte `bytes` objects. The
+decoded block was a list containing more byte strings, followed by a
+`b"".join(buffer)` copy before inverse BWT.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Calculate the three point coordinates directly. | The temporary scaled vector is only an intermediate value. | Removes one vector allocation and the `scale` and addition method calls per shaded hit. | No reliable isolated speedup was measured. It contributes to V2's 20.6% reduction in vector constructions. |
+| Store byte values as integers and accumulate decoded data in one `bytearray`. | BZip2 symbols are values from 0 to 255. A bytearray packs those values directly instead of keeping list entries that point to one-byte strings and run chunks. | Fewer list entries, references, intermediate chunks, pointer loads, and copies; denser data is expected to improve cache locality. | Together with contiguous final output, this is consistent with the combined 39.04% RSS, 67.59% L1-miss, 71.95% cache-miss, and 43.23% page-fault reductions. |
 
 **Before**
 
 ```python
-def pointAtTime(self, t):
-    return self.point + self.vector.scale(t)
+favourites = [int2byte(i) for i, x in enumerate(used) if x]
+buffer = []
+buffer.append(favourites[0] * repeat)
+buffer.append(o)
+nt = bwt_reverse(b"".join(buffer), pointer)
 ```
 
 **After**
 
 ```python
-def pointAtTime(self, t):
-    point = self.point
-    vector = self.vector
-    return Point(point.x + t * vector.x, point.y + t * vector.y, point.z + t * vector.z)
+favourites = [i for i, x in enumerate(used) if x]
+buffer = bytearray()
+buffer.extend(bytes([favourites[0]]) * repeat)
+buffer.append(val)
+nt = bwt_reverse(buffer, pointer)
 ```
 
-**Presentation takeaway:** The hit point is built directly, without a temporary
-displacement object.
+**Simple explanation:** Instead of managing a list of references and chunks and
+joining them later, the optimized code stores byte values next to each other in one container.
 
-### 6.4 Direct `Sphere.normalAt()` arithmetic
+## 15. Improvement 11: use one contiguous final output buffer
 
-**Problem:** A sphere normal first used overloaded point subtraction to create a
-vector, then sent that vector through the general normalization call chain.
+**Problem:** The original final run-length loop created byte slices and stored
+them in a list. Just before returning, `bzip2_main()` joined 302,016 separate
+byte-string entries.
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
+| Change | How and why | Expected software and hardware effect | Relation to measured stats |
 |---|---|---|---|
-| Combine subtraction and normalization inside `normalAt`. | The same three displacement values can be normalized immediately. | Removes one temporary vector plus several method calls and attribute checks for each sphere hit. | No reliable isolated speedup was measured. The server's combined V2 result confirms that the group reduced real work. |
+| Accumulate output in one `bytearray`, append integer bytes, extend repeated runs, cache the loop length, and convert to immutable `bytes` once. | The result is naturally a byte sequence, so a contiguous byte buffer matches the data better than a list of byte objects. | Expected to reduce object allocation, pointer chasing, final joining, memory traffic, and working-set size. | Original held 302,016 list entries before joining; optimized held one 399,360-byte bytearray. The measured RSS and cache reductions are consistent with the combined buffer changes. |
 
 **Before**
 
 ```python
-def normalAt(self, p):
-    return (p - self.centre).normalized()
-```
-
-**After**
-
-```python
-def normalAt(self, p):
-    centre = self.centre
-    x = p.x - centre.x
-    y = p.y - centre.y
-    z = p.z - centre.z
-    factor = 1.0 / math.sqrt((x * x) + (y * y) + (z * z))
-    return Vector(factor * x, factor * y, factor * z)
-```
-
-**Presentation takeaway:** The normal is calculated in one place and only the
-final vector is allocated.
-
-## 7. V3 — cache values that do not change
-
-V3 looked for calculations whose input stays constant during the render. It
-calculates each of those values once and reuses it.
-
-| V2 to V3 | Before | After | Change |
-|---|---:|---:|---:|
-| Benchmark time [ms] | 12,734.2 | 12,075.5 | **-5.17%** |
-| Instructions [B] | 77.80 | 74.43 | **-4.33%** |
-| Cycles [B] | 30.33 | 29.44 | **-2.92%** |
-| Branch instructions [B] | 12.95 | 12.39 | **-4.34%** |
-| Branch misses [M] | 68.10 | 66.87 | **-1.79%** |
-| L1 data loads [B] | 18.23 | 17.15 | **-5.90%** |
-| L1 data-load misses [M] | 326.12 | 376.70 | **+15.51%** |
-
-The higher L1-miss count does not mean the change failed. Runtime, instructions,
-cycles, and total L1 loads all fell. Software caching means “save a calculated
-value”; it does not promise fewer misses in the processor's hardware cache.
-
-### 7.1 Cache each sphere's radius squared
-
-**Problem:** A sphere's radius never changes in this scene, but
-`radius * radius` ran during every sphere intersection.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Calculate `radiusSquared` when the sphere is constructed and read it during intersections. | One value is constant for the sphere's entire lifetime in this benchmark. | Replaces repeated Python multiplication with an attribute read. At 100x100, radius-squared multiplications fall from 179,457 to 7. | Radius-only local timing was about 1.05x faster. Together with camera caching, V3 reduced server time 5.17% and instructions 4.33%. |
-
-**Before**
-
-```python
-def __init__(self, centre, radius):
-    self.centre = centre
-    self.radius = radius
-
-discriminant = (self.radius * self.radius) - (cpSquared - v * v)
-```
-
-**After**
-
-```python
-def __init__(self, centre, radius):
-    self.centre = centre
-    self.radius = radius
-    self.radiusSquared = radius * radius
-
-discriminant = self.radiusSquared - (cpSquared - v * v)
-```
-
-**Presentation takeaway:** Seven spheres now calculate seven squared radii instead
-of recalculating them for every ray.
-
-### 7.2 Cache the combined camera-column direction
-
-**Problem:** V1 cached the horizontal offset, but every pixel still recalculated
-`eye.vector + xcomp`.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Cache `eye direction + horizontal offset` once per column. | This sum is identical for every pixel in a column. Each pixel then adds only its row offset. | At 800x800 it avoids 639,200 temporary vectors and 1,917,600 coordinate additions. At 100x100, vector additions fall from 20,000 to 10,100. | Camera-only local timing was about 1.04x faster. It is part of V3's 5.17% server time reduction. |
-
-**Before**
-
-```python
-xcomponents = [vpRight.scale(x * pixelWidth - halfWidth) for x in range(canvas.width)]
-for y in range(canvas.height):
-    ycomp = vpUp.scale(y * pixelHeight - halfHeight)
-    for x, xcomp in enumerate(xcomponents):
-        ray = Ray(eye.point, eye.vector + xcomp + ycomp)
-```
-
-**After**
-
-```python
-columnDirections = [eye.vector + vpRight.scale(x * pixelWidth - halfWidth) for x in range(canvas.width)]
-for y in range(canvas.height):
-    ycomp = vpUp.scale(y * pixelHeight - halfHeight)
-    for x, columnDirection in enumerate(columnDirections):
-        ray = Ray(eye.point, columnDirection + ycomp)
-```
-
-**Presentation takeaway:** Each column's shared camera direction is calculated
-once instead of once per pixel.
-
-## 8. V4 — process rays in NumPy batches
-
-V1–V3 made scalar Python more efficient, but every ray still passed through
-Python loops and Python objects. V4 changed the data layout and processed many
-rays with compiled NumPy array operations.
-
-| V3 to V4, batch 1024 | Before | After | Change |
-|---|---:|---:|---:|
-| Benchmark time [ms] | 12,075.5 | 3,862.3 | **-68.02%** |
-| Instructions [B] | 74.43 | 21.01 | **-71.77%** |
-| Cycles [B] | 29.44 | 9.71 | **-67.00%** |
-| Branch instructions [B] | 12.39 | 3.58 | **-71.10%** |
-| Branch misses [M] | 66.87 | 24.25 | **-63.74%** |
-| L1 data loads [B] | 17.15 | 4.30 | **-74.91%** |
-| L1 data-load misses [M] | 376.70 | 213.00 | **-43.46%** |
-| Generic cache references [M] | 35.21 | 97.97 | **+178.24%** |
-
-The extra cache references come from working on NumPy arrays. That tradeoff was
-worth it: moving repetitive loops out of the interpreter removed over 70% of
-instructions and cut runtime by 68%.
-
-### 8.1 Dispatch rendering to a batched backend
-
-**Problem:** The scalar renderer entered Python once for every pixel and then
-again for every recursive ray, object, and light.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Replace the scalar pixel loop in `Scene.render` with one `BatchedRenderer` call. | This makes the array implementation the hot rendering path while keeping the benchmark and scene interface. | Far fewer Python loop iterations and calls. More work is performed inside compiled numeric kernels. | This is the entry point to V4. The full V4 stage reduced runtime 68.02% at batch 1024. |
-
-**Before**
-
-```python
-for y in range(canvas.height):
-    ycomp = vpUp.scale(y * pixelHeight - halfHeight)
-    for x, columnDirection in enumerate(columnDirections):
-        ray = Ray(eye.point, columnDirection + ycomp)
-        colour = self.rayColour(ray)
-        canvas.plot(x, y, *colour)
-```
-
-**After**
-
-```python
-def render(self, canvas, batch_size=DEFAULT_BATCH_SIZE):
-    BatchedRenderer(self).render(canvas, batch_size)
-```
-
-**Presentation takeaway:** Python starts a batch instead of tracing each pixel
-through the full scalar pipeline.
-
-### 8.2 Pack scene and material values into numeric arrays
-
-**Problem:** Scalar rays repeatedly followed Python object references and read
-attributes such as centre, colour, and material coefficients.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Copy the static scene values into contiguous `float64` and Boolean arrays once per render. | A complete batch can read compact numeric data instead of many small Python objects. Packing remains inside the timed workload. | Better spatial locality, less pointer chasing, and data that compiled loops and possible SIMD kernels can consume directly. Array allocation raises peak memory. | Part of V4's 71.77% instruction and 74.91% L1-load reduction at batch 1024. Peak memory rose from about 36.5 MiB to 49.0 MiB. |
-
-**Before**
-
-```python
-class Scene(object):
-    def __init__(self):
-        self.objects = []
-
-    def addObject(self, object, surface):
-        self.objects.append((object, surface))
-
-for o, s in self.objects:
-    t = o.intersectionTime(ray)
-```
-
-**After**
-
-```python
-self.geometry = []
-for obj, surface in scene.objects:
-    if isinstance(obj, Sphere):
-        self.geometry.append((self.coordinates(obj.centre), obj.radiusSquared, None))
+nt = nearly_there = bwt_reverse(b"".join(buffer), pointer)
+i = 0
+while i < len(nearly_there):
+    if i < len(nearly_there) - 4 and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+        out.append(nearly_there[i:i + 1] * (ord(nearly_there[i + 4:i + 5]) + 4))
+        i += 5
     else:
-        self.geometry.append((None, None, self.coordinates(obj.normal)))
+        out.append(nearly_there[i:i + 1])
+        i += 1
 
-self.baseColours = np.array([s.baseColour for s in surfaces], dtype=np.float64).reshape(-1, 3).T.copy()
-self.specular = np.array([s.specularCoefficient for s in surfaces])
-self.lambert = np.array([s.lambertCoefficient for s in surfaces])
-self.ambient = np.array([s.ambientCoefficient for s in surfaces])
-```
-
-**Presentation takeaway:** Scene data is arranged as numbers the processor can
-scan efficiently.
-
-### 8.3 Generate configurable batches of primary rays
-
-**Problem:** The scalar loop creates and normalizes one `Ray` object at a time.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Generate consecutive pixel indices, camera directions, and origins as arrays whose size is selected with `--batch-size`. | One array call handles many independent rays, and a shorter final batch handles the remainder. | Amortizes Python and NumPy call overhead across many rays. Larger batches use more temporary memory but give compiled loops more work per call. | Small local batches were slower because overhead dominated. At 100x100, batch 1 was 29.8x slower than scalar, while batch 1024 was 3.94x faster in the exploratory sweep. |
-
-**Before**
-
-```python
-for y in range(canvas.height):
-    for x, columnDirection in enumerate(columnDirections):
-        ray = Ray(eye.point, columnDirection + ycomp)
-        colour = self.rayColour(ray)
+return b"".join(out)
 ```
 
 **After**
 
 ```python
-for start in range(0, width * height, batch_size):
-    pixels = np.arange(start, min(start + batch_size, width * height))
-    x = pixels % width
-    y = pixels // width
-    directions = self.normalized(columns[:, x] + rows[:, y])
-    yield (x, y, np.broadcast_to(origin, directions.shape), directions)
+nt = bwt_reverse(buffer, pointer)
+i = 0
+nt_len = len(nt)
+while i < nt_len:
+    if i < nt_len - 4 and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+        count = nt[i + 4] + 4
+        out.extend(bytes([nt[i]]) * count)
+        i += 5
+    else:
+        out.append(nt[i])
+        i += 1
+
+return bytes(out)
 ```
 
-The command-line option is forwarded into the renderer:
+**Simple explanation:** The original output was hundreds of thousands of small
+pieces that had to be glued together. The optimized output is built in one
+continuous byte buffer.
 
-```python
-cmd.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-```
+## 16. Changes present in the file but not measured by this benchmark
 
-**Presentation takeaway:** Batch size controls how many rays share one set of
-array operations; it does not select the CPU's SIMD width.
+### 16.1 GZip output improvements
 
-### 8.4 Calculate many sphere intersections at once
-
-**Problem:** The scalar function calculates one ray-sphere pair through Python
-for every call.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Store ray coordinates in array columns and apply the same intersection formula element by element. | Ray-sphere tests in a batch are independent and use the same operations. | Moves arithmetic loops into compiled code, exposes independent operations, and lets NumPy use CPU-specific kernels where available. It creates temporary arrays and masks. | A central contributor to V4's 71.77% instruction and 67.00% cycle reduction at batch 1024. No SIMD-instruction counter was collected, so this is not a measured SIMD-only gain. |
+The GZip path also changed from lists of one-byte objects to `bytearray` and
+from list concatenation to `extend()`.
 
 **Before**
 
 ```python
-cpx = centre.x - point.x
-cpy = centre.y - point.y
-cpz = centre.z - point.z
-v = ((cpx * direction.x) + (cpy * direction.y) + (cpz * direction.z))
-cpSquared = ((cpx * cpx) + (cpy * cpy) + (cpz * cpz))
-discriminant = radiusSquared - (cpSquared - v * v)
+out = []
+out.append(int2byte(b.readbits(8)))
+out.append(int2byte(r))
+out += out[-distance:]
+return "".join(out)
 ```
 
 **After**
 
 ```python
-cp = centre - origins
-v = self.dot(cp, directions)
-discriminant = radiusSquared - (self.dot(cp, cp) - v * v)
-hits = discriminant >= 0
-times[hits] = v[hits] - np.sqrt(discriminant[hits])
+out = bytearray()
+out.append(b.readbits(8))
+out.append(r)
+out.extend(out[-distance:])
+return bytes(out)
 ```
 
-**Presentation takeaway:** One Python request now calculates the formula for many
-independent rays.
+These are reasonable representation improvements, but the benchmark input has
+BZip2 magic `0x425a`. `gzip_main()` is never called, so none of the measured
+1.54x speedup may be credited to this change.
 
-### 8.5 Select closest hits with Boolean masks
+### 16.2 Correctness and cleanup edits
 
-**Problem:** Even after V1, Python still updated the closest hit separately for
-each ray.
+The rewrite also contains edits that should not be presented as performance
+wins:
 
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Compare candidate times for a complete batch and update only array positions selected by a Boolean mask. | Each array lane represents one ray. Object traversal order and strict comparison preserve the original tie behavior. | Replaces many Python branches and loop iterations with compiled comparisons and indexed writes. | Supports V4's 71.10% drop in branch instructions and 63.74% drop in branch misses at batch 1024. These are full-stage figures. |
+| Edit | Purpose |
+|---|---|
+| Copy `x.count` instead of `x.bitfield` into a copied bitfield | Correct the stored byte count. |
+| Use a strict selector bound, `selector_pointer < len(selectors_list)` | Avoid indexing one position beyond the selector list. |
+| Replace string raises with exception objects | Use valid modern Python exception behavior. |
+| Return the dictionary from `tables_by_bits()` | Complete an otherwise unused helper. |
+| Simplify names, comments, messages, and dead branches | Improve readability and maintenance. |
+| Stop subtracting `ord('0')` from the unused BZip2 block-size field | Remove unused work with negligible effect. |
 
-**Before**
+These changes are part of the source difference but are not the reason for the
+large timing result.
 
-```python
-if t is not None and t > -EPSILON:
-    if closestTime is None or t < closestTime:
-        closestObject = o
-        closestTime = t
-```
+## 17. Cause and effect summary
 
-**After**
-
-```python
-candidate = self.intersectionTimes(index, origins, directions)
-selected = ((candidate > -EPSILON) & ((closest < 0) | (candidate < times)))
-closest[selected] = index
-times[selected] = candidate[selected]
-```
-
-**Presentation takeaway:** A mask performs the same decision for a full group of
-rays.
-
-### 8.6 Preserve shadow early exit with batched filtering
-
-**Problem:** A shadow ray should stop testing objects as soon as a blocker is
-found, but different rays in a batch become blocked at different times.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Track visible rays and remove blocked indices before testing the next object. | This is the batched equivalent of returning `False` immediately for one ray. | Avoids later intersection work for already blocked rays while retaining array processing for the remaining rays. Index arrays and masks add some memory traffic. | Included in V4's major reductions in instructions, cycles, branches, and L1 loads. There was no separate server counter run for this method alone. |
-
-**Before**
-
-```python
-for (o, s) in self.objects:
-    t = o.intersectionTime(ray)
-    if t is not None and t > EPSILON:
-        return False
-```
-
-**After**
-
-```python
-visible = np.ones(directions.shape[1], dtype=bool)
-remaining = np.arange(directions.shape[1])
-
-for index in range(len(self.geometry)):
-    if remaining.size == 0:
-        break
-    times = self.intersectionTimes(index, origins[:, remaining], directions[:, remaining])
-    blocked = times > EPSILON
-    visible[remaining[blocked]] = False
-    remaining = remaining[~blocked]
-```
-
-**Presentation takeaway:** Blocked rays leave the batch's remaining shadow work,
-just as one scalar ray would return early.
-
-### 8.7 Batch normals, material selection, lighting, and reflections
-
-**Problem:** Intersections alone were not enough. Returning to scalar Python for
-normals, checker colours, lights, and recursion would keep most interpreter
-overhead.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Keep hit rays in arrays through normal calculation, checker selection, light accumulation, and recursive reflection. | A substantial kernel is needed so the cost of entering NumPy is spread across the full ray pipeline. | Keeps coordinates in compact arrays, exposes independent arithmetic, and removes per-ray Python calls. Masks and temporary arrays increase memory use and some cache counters. | Explains why V4 delivered a 3.13x stage speedup rather than only accelerating one formula. After V4, remaining Python profiling weight shifted toward `Canvas.plot`. |
-
-**Before**
-
-```python
-reflectedRay = Ray(p, ray.vector.reflectThrough(normal))
-reflectedColour = scene.rayColour(reflectedRay)
-c = addColours(c, self.specularCoefficient, reflectedColour)
-```
-
-**After**
-
-```python
-d = directions[:, selected]
-n = normals[:, selected]
-projection = self.dot(d, n)
-reflected = self.normalized(d - 2 * (projection * n))
-reflectedColour = self.rayColours(points[:, selected], reflected, depth + 1)
-shaded[:, selected] = shaded[:, selected] + specular[selected] * reflectedColour
-```
-
-Checker colours are also selected for all relevant hits:
-
-```python
-parity = np.remainder(np.floor(np.abs(points[:, selected]) + 0.5), 2)
-odd = ((parity[0] + parity[1] + parity[2]) % 2) != 0
-alternate = np.flatnonzero(selected)[odd]
-colours[:, alternate] = self.otherColours[:, objects[alternate]]
-```
-
-**Presentation takeaway:** Rays stay batched through the expensive recursive
-shading work.
-
-### 8.8 Tune the batch size from 1024 to 2048
-
-**Problem:** Batch size trades call overhead against temporary-array size. The
-best value must be measured for the workload and machine.
-
-| Change | How and why | Expected software and hardware effect | Relation to measured results |
-|---|---|---|---|
-| Increase the default from 1024 to 2048 rays after the server comparison. | At 800x800, about 625 batches are needed at 1024 but only about 313 at 2048. | Fewer Python-to-NumPy transitions, allocations, batch-loop branches, and repeated setup operations; each batch needs more temporary storage. | 1024 to 2048 cut time 17.57%, instructions 12.69%, cycles 16.11%, and branch misses 24.90%. Measured peak memory stayed near 49 MiB in these runs. |
-
-**Before**
-
-```python
-DEFAULT_BATCH_SIZE = 1024
-```
-
-**After**
-
-```python
-DEFAULT_BATCH_SIZE = 1024 * 2
-```
-
-The renderer remains configurable:
-
-```bash
-python run_benchmark.py --width 800 --height 800 --batch-size 2048
-```
-
-**Presentation takeaway:** A larger batch gave NumPy more useful work per call
-and reduced the number of batches by about half.
-
-## 9. Did V4 use SIMD?
-
-NumPy can use SIMD, but “using NumPy” is not proof that every operation executed
-as a SIMD instruction.
-
-SIMD means **Single Instruction, Multiple Data**. A CPU instruction applies the
-same operation to several numbers at once. A simple analogy is carrying four
-boxes in one cart instead of making four separate trips.
-
-V4 gives NumPy arrays of independent rays:
-
-```python
-cp = centre - origins
-v = self.dot(cp, directions)
-discriminant = radiusSquared - (self.dot(cp, cp) - v * v)
-```
-
-That layout makes SIMD possible because the same add, subtract, and multiply
-operations are applied across many elements. The local NumPy dispatch report
-selected CPU-specific x86 kernels for the relevant `float64` operations.
-However:
-
-- Batch size is a software work size, not a SIMD lane count.
-- NumPy decides which compiled kernel to use.
-- Masks, strides, and short arrays can affect the executed path.
-- The collected `perf stat` files did not count SIMD instructions.
-- The measured V4 speedup combines less Python overhead, compiled loops, compact
-  numeric data, better exposure of independent arithmetic, and possible SIMD.
-
-The accurate presentation statement is: **V4 enabled NumPy to use optimized
-compiled and potentially SIMD kernels, but the experiment did not isolate or
-count a SIMD-only speedup.**
-
-## 10. Software–hardware cause and effect
-
-| Software decision | What changed for the processor | Evidence |
+| Observed change | Direct cause in the code | Why the CPU benefits |
 |---|---|---|
-| Reuse results and remove temporary objects | Less allocation, pointer chasing, reference counting, and interpreter work | V1 cut instructions 55.56% and L1 loads 55.55%. |
-| Write hot arithmetic directly | Fewer Python frames and dynamic method lookups around the same math | V2 cut another 6.25% of instructions and 8.19% of cycles. |
-| Cache constant values | Fewer repeated additions and multiplications | V3 cut another 4.33% of instructions and 5.17% of time. |
-| Pack numeric arrays | More regular memory access and data usable by compiled kernels; more temporary-array memory | V4 used about 34% more peak memory and more generic cache references. |
-| Batch full ray pipelines | Many independent operations run per Python call; possible SIMD and more instruction-level parallelism | V3 to V4-1024 cut instructions 71.77%, cycles 67.00%, and time 68.02%. |
-| Increase batch size | Fewer batches and less setup per ray | 1024 to 2048 cut another 17.57% of time. |
+| Time fell 35.07% | Less work in bit reading, lookup, MTF, and byte assembly | The interpreter executes fewer operations for the same decompression. |
+| Instructions fell 34.94% | Removed helper calls, loops, temporary lists, byte objects, and joins | Fewer machine instructions are needed around the useful arithmetic. |
+| Branches fell 42.33% | Dictionary probes replace many table-entry loop iterations; hot helper calls disappear | The core executes fewer loop and call-control branches. |
+| Branch misses fell 42.83% but the miss rate stayed near 0.52% | Total branch count fell | Prediction quality is similar; there are simply fewer branches to predict. |
+| L1 data-load misses fell 67.59% | Bytearrays replace lists of references and tiny byte objects | More useful data is packed into fewer cache lines. |
+| Cache misses fell 71.95% | Fewer temporary objects and a smaller working set | The core waits less often for data farther down the memory hierarchy. |
+| Maximum RSS fell 39.04% | Contiguous buffers replace hundreds of thousands of Python objects | The process needs less object payload and allocator metadata. |
+| IPC fell slightly | Remaining work has different dependency and memory behavior | Speedup did not come from more instructions per cycle; it came from removing instructions. |
 
-The final version intentionally trades some array storage and generic cache
-activity for a much larger decrease in interpreted work.
+The counters describe the **combined optimized program**. They support these
+mechanisms, but they cannot tell us exactly how many milliseconds belong to
+each source edit.
 
-## 11. Final result
+## 18. Did this optimization use SIMD?
 
-| Original to final V4, batch 2048 | Original | Final | Change |
-|---|---:|---:|---:|
-| Benchmark time [ms] | 29,832.6 | 3,183.6 | **9.37x faster / -89.33%** |
-| Instructions [B] | 186.72 | 18.34 | **-90.18%** |
-| Cycles [B] | 71.65 | 8.15 | **-88.62%** |
-| Branch misses [M] | 173.48 | 18.21 | **-89.50%** |
-| L1 data-load misses [M] | 585.92 | 201.15 | **-65.67%** |
-| dTLB load misses [M] | 6.93 | 1.45 | **-79.14%** |
-| iTLB load misses [M] | 4.51 | 1.36 | **-69.90%** |
-| Generic cache references [M] | 45.85 | 78.68 | **+71.60%** |
-| Generic cache misses [K] | 189.90 | 671.85 | **+253.79%** |
-| Minor page faults | 11,915 | 16,466 | **+38.20%** |
+No deliberate SIMD was added.
 
-The repeated final fast run measured **3,118.9 +/- 38.3 ms** over 20 values,
-which is about **9.57x faster** than the saved original timing. The 9.37x figure
-is used for the strict stage table because it compares the selected single-run
-Original and V4 results.
+- There is no NumPy.
+- There are no compiler intrinsics.
+- There is no native extension.
+- The hot loops still execute as CPython bytecode on one core.
 
-The strongest conclusion is not that every counter improved. Several
-array-related memory counters increased. The important result is that the
-processor executed about 90% fewer instructions and 89% fewer cycles while
-producing the same tested image.
+SIMD means one machine instruction performs the same operation on several
+numbers at once. A simple example is adding four pairs of numbers with one
+vector instruction instead of four scalar instructions.
 
-## 12. Measurement limits
+Several Pyflate stages are difficult to vectorize directly:
 
-- Timing and `perf stat` were separate executions. Timing is the main
-  performance result; counters explain the trend.
-- Original was measured on an earlier server boot. V1 through V4 share one boot,
-  and all runs used the same CPU model, Python version, input, and one-CPU setup.
-- The stage timings are single diagnostic values. The final V4 run has the
-  stronger 20-value repeat.
-- Hardware events were multiplexed and ran for about 20–30% of collection time.
-  Perf scaled the displayed counts. Large differences are useful evidence;
-  small differences should be treated cautiously.
-- Server counters describe complete versions. A stage-wide counter change
-  cannot be assigned exactly to one micro-optimization without a separate
-  `perf stat` run for that edit.
-- The individual desktop experiments are useful for ranking changes but do not
-  replace the server measurements.
+| Stage | Dependency that limits batching |
+|---|---|
+| Variable-length Huffman decoding | The length of the current code decides where the next code begins. |
+| Move-to-front decoding | Every decoded symbol changes the list used by the next symbol. |
+| Inverse BWT | Each pointer tells the decoder which pointer to follow next. |
+| Run-length decoding | A control symbol decides how much output is produced next. |
 
-## 13. Evidence files
+The optimization still helped the hardware by reducing instructions and packing
+data more tightly. That is a memory and interpreter-overhead improvement, not
+SIMD.
 
-- [Optimization and validation notes](../suites/optimized/bm_raytrace/OPTIMIZATIONS.md)
-- [Original perf stat](../results/raytrace/original/perf_stat.txt)
-- [V1 perf stat](../results/raytrace/optimized/2026-09-17-13-27%20single%20v1/perf_stat.txt)
-- [V2 perf stat](../results/raytrace/optimized/2026-09-17-14-13%20single%20v2/perf_stat.txt)
-- [V3 perf stat](../results/raytrace/optimized/2026-09-17-14-18%20single%20v3/perf_stat.txt)
-- [V4 batch-1024 perf stat](../results/raytrace/optimized/2026-09-17-14-22%20single%20v4%201024/perf_stat.txt)
-- [V4 batch-2048 perf stat](../results/raytrace/optimized/2026-09-17-14-23%20single%20v4%202048/perf_stat.txt)
-- [V1 isolated local stages](../results/raytrace/validation/2026-09-09-windows/README.md)
-- [V2 helper validation](../results/raytrace/validation/2026-09-10-helpers/README.md)
-- [V3 caching validation](../results/raytrace/validation/2026-09-10-radius-camera/README.md)
-- [V4 NumPy validation](../results/raytrace/validation/2026-09-10-numpy-batches/README.md)
+## 19. Hardware co-design connection
+
+The remaining Huffman lookup is a reasonable hardware target because a hardware
+unit can store the tables close to the matcher and compare several candidate
+entries at the same time.
+
+The repository contains an RTL design described in the [hardware acceleration report](../hardware/pyflate_v2/report/05_acceleration_justification.md):
+
+```mermaid
+flowchart LR
+    A[Compressed byte stream] --> B[Bit reservoir]
+    B --> C[Six-table Huffman matcher]
+    D[Huffman tables and selectors] --> C
+    C --> E[Decoded symbol and consumed length]
+    E --> B
+```
+
+This is **spatial parallelism**: hardware contains several comparison circuits
+that operate together. It is not software SIMD, and the next symbol still
+depends on how many bits the current symbol consumes.
+
+For the measured workload:
+
+| Hardware-study input | Value |
+|---|---:|
+| Huffman symbols | 148,271 |
+| Current complete-top initiation interval | 2 cycles/symbol |
+| Fill plus decode cycle model | `3 + 148,271 x 2 = 296,545 cycles` |
+| Frequency | 200 MHz target, not measured |
+| Analytical core time at that target | 1.483 ms |
+
+Using the sampled software scope, the analytical component speedup is about
+54.1x when crediting only the lookup function's self time, or 172.9x when
+crediting its complete bit-reader subtree. Amdahl's law turns that into an
+estimated original-program speedup of about **1.135x to 1.626x before
+integration overhead**.
+
+These are projections, not measured FPGA results. The design has not yet been
+validated by synthesis, place-and-route, or end-to-end hardware execution. The
+200 MHz figure is a target.
+
+## 20. Validation and evidence
+
+The current files match the source hashes recorded by the server after
+normalizing line endings:
+
+| Source | Normalized SHA-256 |
+|---|---|
+| Original | `ec5347c7045af86ba33e1b2c6f64bc4b506d0ade3b77391d7e41863fe25fb464` |
+| Optimized | `cd4394b988f7a5751cc8ef2707e73bf198a130d98e266854aac5d352a703a44d` |
+
+Validation performed:
+
+- Directly decoded the repository input with both modules.
+- Confirmed identical 399,360-byte output, MD5, and SHA-256.
+- Ran all six tests in [`tests/test_huffman_reference.py`](../tests/test_huffman_reference.py); all passed.
+- Used [original `timing.json`](../results/pyflate/original/original%20results%20full%20run/timing.json) and [optimized `timing.json`](../results/pyflate/optimized/2026-09-12-15-16/timing.json) for benchmark timing.
+- Used [original `perf_stat.txt`](../results/pyflate/original/original%20results%20full%20run/perf_stat.txt) and [optimized `perf_stat.txt`](../results/pyflate/optimized/2026-09-12-15-16/perf_stat.txt) only for supporting counter trends.
+- Used sampled profiles to explain hot paths, with the limitation that they used debug Python while the timing runs used regular Python.
+
+## 21. Presentation takeaway
+
+The optimized Pyflate is **1.54x faster** and uses about **39% less peak
+memory** while producing exactly the same output.
+
+The strongest evidence is the direct relationship between fewer Python
+instructions and lower time:
+
+```text
+Instructions: -34.94%
+Mean time:    -35.07%
+```
+
+The main ideas were to replace repeated linear Huffman entry scans with
+dictionary probes, remove function calls and list slicing from move-to-front
+updates, and store byte data in compact bytearrays instead of hundreds of
+thousands of small Python objects. The BWT counting and preallocation changes
+did not show a clear individual benefit, which is why they are presented as
+unconfirmed rather than automatically credited for the final speedup.
